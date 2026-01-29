@@ -1,0 +1,27 @@
+[
+	{
+		"doctype": "Custom Field",
+		"module": "Mail Scheduler",
+		"dt": "Mail Queue",
+		"fieldname": "scheduled_at",
+		"fieldtype": "Datetime",
+		"label": "Scheduled At",
+		"insert_after": "status",
+		"description": "When this email is scheduled to be sent",
+		"in_list_view": 1,
+		"in_standard_filter": 1,
+		"search_index": 1
+	},
+	{
+		"doctype": "Custom Field",
+		"module": "Mail Scheduler",
+		"dt": "Mail Queue",
+		"fieldname": "submission_id",
+		"fieldtype": "Data",
+		"label": "Submission ID",
+		"insert_after": "scheduled_at",
+		"description": "JMAP EmailSubmission ID for scheduled emails",
+		"read_only": 1,
+		"hidden": 1
+	}
+]
