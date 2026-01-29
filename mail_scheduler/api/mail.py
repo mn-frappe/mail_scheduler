@@ -8,22 +8,22 @@ to add scheduled email functionality without modifying the core app.
 
 import frappe
 from frappe import _
+from frappe.utils import get_datetime, now_datetime, add_to_date, random_string
 
 
 @frappe.whitelist()
 def create_mail(
-	from_: str,
-	to: str | list,
-	cc: str | list | None = None,
-	bcc: str | list | None = None,
-	subject: str = "",
-	text_body: str | None = None,
-	html_body: str | None = None,
-	attachments: list | None = None,
-	reply_to: str | None = None,
+	from_email: str,
+	to: list[str],
+	cc: list[str],
+	bcc: list[str],
+	subject: str | None,
+	html_body: str | None,
+	from_name: str = "",
+	attachments: list[dict] | None = None,
 	in_reply_to: str | None = None,
-	references: str | list | None = None,
-	custom_headers: dict | None = None,
+	in_reply_to_id: str | None = None,
+	forwarded_from_id: str | None = None,
 	save_as_draft: bool = False,
 	scheduled_at: str | None = None,
 ) -> dict:
@@ -31,431 +31,374 @@ def create_mail(
 	Create and send/schedule an email.
 
 	This wraps the mail app's create_mail API and adds scheduled_at support.
+	The API signature matches mail.api.mail.create_mail exactly, with an
+	additional scheduled_at parameter.
 
 	Args:
-		from_: Sender email address
-		to: Recipient(s) - string or list
-		cc: CC recipient(s)
-		bcc: BCC recipient(s)
+		from_email: Sender email address
+		to: List of To recipients
+		cc: List of CC recipients
+		bcc: List of BCC recipients
 		subject: Email subject
-		text_body: Plain text body
-		html_body: HTML body
-		attachments: List of attachment dicts
-		reply_to: Reply-To address
+		html_body: HTML body content
+		from_name: Display name for sender
+		attachments: List of attachment dicts with file_url, type, size, filename
 		in_reply_to: Message-ID being replied to
-		references: Referenced Message-IDs
-		custom_headers: Additional email headers
+		in_reply_to_id: Mail Message ID being replied to
+		forwarded_from_id: Mail Message ID being forwarded
 		save_as_draft: If True, save as draft instead of sending
-		scheduled_at: Datetime string for scheduled delivery (local time)
+		scheduled_at: Datetime string for scheduled delivery (ISO format or Frappe datetime)
 
 	Returns:
-		dict with mail_message name and scheduled_at if scheduled
+		dict with id, status, error, and scheduled_at if scheduled
 	"""
-	from mail.api.mail import get_or_create_mail_message, validate_mail_data
+	from mail.client.doctype.mail_queue.mail_queue import MailQueue
+	from mail.utils import convert_img_src_from_file_url_to_cid
 
-	# Parse recipients
-	to = _parse_recipients(to)
-	cc = _parse_recipients(cc) if cc else []
-	bcc = _parse_recipients(bcc) if bcc else []
-	references = _parse_recipients(references) if references else []
-
-	# Validate mail data
-	validate_mail_data(from_, to, cc, bcc, subject, text_body, html_body)
-
-	# If scheduled, validate schedule time
+	# Validate schedule time if provided
 	if scheduled_at and not save_as_draft:
 		_validate_schedule_time(scheduled_at)
 
-	# Get or create mail message
-	mail_message = get_or_create_mail_message(
-		from_=from_,
-		to=to,
-		cc=cc,
-		bcc=bcc,
-		subject=subject,
-		text_body=text_body,
-		html_body=html_body,
-		attachments=attachments,
-		reply_to=reply_to,
-		in_reply_to=in_reply_to,
-		references=references,
-		custom_headers=custom_headers,
-	)
+	# Process attachments (same as mail.api.mail.create_mail)
+	doc_attachments = []
+	for d in attachments or []:
+		cid = random_string(10)
+		doc_attachments.append(
+			{
+				"file_url": d.get("file_url", ""),
+				"blob_id": d.get("blob_id", ""),
+				"filename": d.get("file_name") or d.get("filename", ""),
+				"type": d.get("type", ""),
+				"size": d.get("size", ""),
+				"disposition": d.get("disposition"),
+				"cid": cid,
+			}
+		)
+		if d.get("disposition") == "inline" and html_body:
+			html_body = convert_img_src_from_file_url_to_cid(html_body, d.get("file_url"), cid)
 
-	result = {"mail_message": mail_message.name}
+	# Build recipients list
+	recipients = [{"type": "To", "email": email} for email in (to or [])]
+	recipients += [{"type": "Cc", "email": email} for email in (cc or [])]
+	recipients += [{"type": "Bcc", "email": email} for email in (bcc or [])]
 
-	if save_as_draft:
-		mail_message.save_as_draft()
-	else:
-		# Submit with optional scheduling
-		mail_message.submit(scheduled_at=scheduled_at)
-		if scheduled_at:
-			result["scheduled_at"] = scheduled_at
-			result["status"] = "Scheduled"
+	# Set scheduled_at flag so our hook can pick it up
+	if scheduled_at and not save_as_draft:
+		frappe.flags.mail_scheduler_scheduled_at = get_datetime(scheduled_at)
 
-	return result
+	try:
+		# Create mail queue using the standard method
+		doc = MailQueue._create(
+			user=frappe.session.user,
+			from_email=from_email,
+			from_name=from_name,
+			subject=subject,
+			html_body=html_body,
+			in_reply_to=in_reply_to,
+			in_reply_to_id=in_reply_to_id,
+			forwarded_from_id=forwarded_from_id,
+			attachments=doc_attachments,
+			recipients=recipients,
+			save_as_draft=save_as_draft,
+		)
+
+		result = {"id": doc.id, "status": doc.status, "error": doc.error_message}
+
+		if scheduled_at and not save_as_draft:
+			result["scheduled_at"] = str(scheduled_at)
+			# Update status to indicate scheduled
+			if doc.status == "Submitted":
+				result["status"] = "Scheduled"
+
+		return result
+	finally:
+		# Clean up flag
+		frappe.flags.pop("mail_scheduler_scheduled_at", None)
 
 
 @frappe.whitelist()
 def update_draft_mail(
-	mail_message_name: str,
-	from_: str | None = None,
-	to: str | list | None = None,
-	cc: str | list | None = None,
-	bcc: str | list | None = None,
-	subject: str | None = None,
-	text_body: str | None = None,
-	html_body: str | None = None,
-	attachments: list | None = None,
-	reply_to: str | None = None,
-	custom_headers: dict | None = None,
-	send: bool = False,
+	id: str,
+	from_email: str,
+	to: list[str],
+	cc: list[str],
+	bcc: list[str],
+	subject: str | None,
+	html_body: str | None,
+	from_name: str = "",
+	attachments: list[dict] | None = None,
+	submit: bool = False,
 	scheduled_at: str | None = None,
 ) -> dict:
 	"""
-	Update a draft email and optionally send/schedule it.
+	Update a draft email and optionally submit/schedule it.
+
+	This wraps the mail app's update_draft_mail API and adds scheduled_at support.
 
 	Args:
-		mail_message_name: Name of the Mail Message document
-		from_: Updated sender address
-		to: Updated recipient(s)
-		cc: Updated CC recipient(s)
-		bcc: Updated BCC recipient(s)
-		subject: Updated subject
-		text_body: Updated plain text body
-		html_body: Updated HTML body
-		attachments: Updated attachments
-		reply_to: Updated Reply-To
-		custom_headers: Updated custom headers
-		send: If True, send/schedule the email
+		id: The JMAP email ID of the draft
+		from_email: Sender email address
+		to: List of To recipients
+		cc: List of CC recipients
+		bcc: List of BCC recipients
+		subject: Email subject
+		html_body: HTML body content
+		from_name: Display name for sender
+		attachments: List of attachment dicts
+		submit: If True, submit the email after updating
 		scheduled_at: Datetime string for scheduled delivery
 
 	Returns:
-		dict with mail_message name and scheduled_at if scheduled
+		dict with id, status, error, and scheduled_at if scheduled
 	"""
-	from mail.api.mail import validate_mail_data
+	from mail.utils import convert_html_to_text, convert_img_src_from_base64_to_cid, convert_img_src_from_file_url_to_cid
 
-	mail_message = frappe.get_doc("Mail Message", mail_message_name)
+	# Validate schedule time if submitting with schedule
+	if scheduled_at and submit:
+		_validate_schedule_time(scheduled_at)
 
-	# Check ownership
-	if mail_message.owner != frappe.session.user:
-		frappe.throw(_("You don't have permission to update this draft"))
+	# Get the draft document
+	doc = frappe.get_doc("Mail Message", f"{frappe.session.user}|{id}")
+	doc.check_permission(permtype="write")
 
-	# Parse recipients
-	to = _parse_recipients(to) if to else None
-	cc = _parse_recipients(cc) if cc else None
-	bcc = _parse_recipients(bcc) if bcc else None
+	# Update fields
+	doc.from_email = from_email
+	doc.from_name = from_name
+	doc.subject = subject
 
-	# Update fields if provided
-	if from_ is not None:
-		mail_message.sender = from_
-	if to is not None:
-		mail_message.recipients = to
-	if cc is not None:
-		mail_message.cc = cc
-	if bcc is not None:
-		mail_message.bcc = bcc
-	if subject is not None:
-		mail_message.subject = subject
-	if text_body is not None:
-		mail_message.text_body = text_body
-	if html_body is not None:
-		mail_message.html_body = html_body
-	if reply_to is not None:
-		mail_message.reply_to = reply_to
-	if custom_headers is not None:
-		mail_message.custom_headers = custom_headers
-
-	# Handle attachments
-	if attachments is not None:
-		mail_message.update_attachments(attachments)
-
-	result = {"mail_message": mail_message.name}
-
-	if send:
-		# Validate before sending
-		validate_mail_data(
-			mail_message.sender,
-			mail_message.recipients,
-			mail_message.cc,
-			mail_message.bcc,
-			mail_message.subject,
-			mail_message.text_body,
-			mail_message.html_body,
+	# Process attachments
+	doc.attachments = []
+	for d in attachments or []:
+		cid = d.get("cid", random_string(10))
+		doc.append(
+			"attachments",
+			{
+				"blob_id": d.get("blob_id", ""),
+				"file_url": d.get("file_url", ""),
+				"type": d.get("type", ""),
+				"size": d.get("size", ""),
+				"filename": d.get("filename", ""),
+				"disposition": d.get("disposition"),
+				"cid": cid,
+			},
 		)
+		if d.get("disposition") == "inline" and html_body:
+			html_body = convert_img_src_from_file_url_to_cid(html_body, d.get("file_url"), cid)
 
-		if scheduled_at:
-			_validate_schedule_time(scheduled_at)
+	doc.html_body = convert_img_src_from_base64_to_cid(html_body) if html_body else None
+	doc.text_body = convert_html_to_text(doc.html_body) if doc.html_body else None
 
-		mail_message.submit(scheduled_at=scheduled_at)
-		if scheduled_at:
-			result["scheduled_at"] = scheduled_at
-			result["status"] = "Scheduled"
-	else:
-		mail_message.save()
+	# Update recipients
+	doc.recipients = []
+	for email in to or []:
+		doc.append("recipients", {"type": "To", "email": email})
+	for email in cc or []:
+		doc.append("recipients", {"type": "Cc", "email": email})
+	for email in bcc or []:
+		doc.append("recipients", {"type": "Bcc", "email": email})
 
-	return result
+	# Set scheduled_at flag if submitting with schedule
+	if scheduled_at and submit:
+		frappe.flags.mail_scheduler_scheduled_at = get_datetime(scheduled_at)
+
+	try:
+		if submit:
+			new_doc = doc.submit()
+		else:
+			new_doc = doc.save_draft()
+
+		result = {"id": new_doc.id, "status": new_doc.status, "error": new_doc.error_message}
+
+		if scheduled_at and submit:
+			result["scheduled_at"] = str(scheduled_at)
+			if new_doc.status == "Submitted":
+				result["status"] = "Scheduled"
+
+		return result
+	finally:
+		frappe.flags.pop("mail_scheduler_scheduled_at", None)
 
 
 @frappe.whitelist()
 def cancel_scheduled_mail(mail_queue_name: str) -> dict:
 	"""
-	Cancel a scheduled email that hasn't been sent yet.
+	Cancel a scheduled email.
 
 	Args:
 		mail_queue_name: Name of the Mail Queue document
 
 	Returns:
-		dict with status and message
+		dict with success status and message
 	"""
-	mail_queue = frappe.get_doc("Mail Queue", mail_queue_name)
+	doc = frappe.get_doc("Mail Queue", mail_queue_name)
+	doc.check_permission(permtype="write")
 
-	# Check ownership
-	if mail_queue.user != frappe.session.user:
-		frappe.throw(_("You don't have permission to cancel this email"))
-
-	# Check if it's a scheduled email
-	scheduled_at = mail_queue.get("scheduled_at")
+	# Check if email is actually scheduled
+	scheduled_at = doc.get("scheduled_at")
 	if not scheduled_at:
 		frappe.throw(_("This email is not scheduled"))
 
-	# Check status
-	if mail_queue.status not in ("Scheduled", "Queued", "Pending"):
-		frappe.throw(_("Cannot cancel: Email status is {0}").format(mail_queue.status))
+	# Check if already sent
+	if doc.status in ["Sent", "Delivered"]:
+		frappe.throw(_("Cannot cancel an email that has already been sent"))
 
-	# Cancel the scheduled email
-	cancel_scheduled_email(mail_queue)
+	# Check if past schedule time
+	if get_datetime(scheduled_at) <= now_datetime():
+		frappe.throw(_("Cannot cancel an email past its scheduled time"))
 
-	return {
+	# Try to cancel via JMAP if submission_id exists
+	submission_id = doc.get("submission_id")
+	if submission_id:
+		try:
+			from mail_scheduler.jmap.futurerelease import email_submission_cancel
+			email_submission_cancel(doc.user, submission_id)
+		except Exception as e:
+			frappe.log_error(f"Failed to cancel JMAP submission: {e}")
+
+	# Update the document
+	doc.db_set({
 		"status": "Cancelled",
-		"message": _("Scheduled email has been cancelled"),
-	}
+		"scheduled_at": None,
+		"submission_id": None,
+	})
+
+	return {"success": True, "message": _("Scheduled email cancelled successfully")}
 
 
 @frappe.whitelist()
-def update_scheduled_mail(mail_queue_name: str, new_scheduled_at: str) -> dict:
+def reschedule_mail(mail_queue_name: str, new_scheduled_at: str) -> dict:
 	"""
-	Update the scheduled time for a pending scheduled email.
+	Reschedule a scheduled email to a new time.
 
 	Args:
 		mail_queue_name: Name of the Mail Queue document
-		new_scheduled_at: New scheduled datetime string
+		new_scheduled_at: New datetime string for scheduled delivery
 
 	Returns:
-		dict with status and new scheduled time
+		dict with success status and new schedule time
 	"""
-	mail_queue = frappe.get_doc("Mail Queue", mail_queue_name)
-
-	# Check ownership
-	if mail_queue.user != frappe.session.user:
-		frappe.throw(_("You don't have permission to update this email"))
-
 	# Validate new schedule time
 	_validate_schedule_time(new_scheduled_at)
 
-	# Check if it's a scheduled email
-	scheduled_at = mail_queue.get("scheduled_at")
-	if not scheduled_at:
+	doc = frappe.get_doc("Mail Queue", mail_queue_name)
+	doc.check_permission(permtype="write")
+
+	# Check if email is actually scheduled
+	old_scheduled_at = doc.get("scheduled_at")
+	if not old_scheduled_at:
 		frappe.throw(_("This email is not scheduled"))
 
-	# Check status
-	if mail_queue.status not in ("Scheduled", "Queued", "Pending"):
-		frappe.throw(_("Cannot update: Email status is {0}").format(mail_queue.status))
+	# Check if already sent
+	if doc.status in ["Sent", "Delivered"]:
+		frappe.throw(_("Cannot reschedule an email that has already been sent"))
 
-	# Update the scheduled time
-	update_scheduled_time(mail_queue, new_scheduled_at)
+	# For now, we cancel and resubmit
+	# In the future, Stalwart may support updating HOLDUNTIL directly
+	submission_id = doc.get("submission_id")
+	if submission_id:
+		try:
+			from mail_scheduler.jmap.futurerelease import email_submission_cancel
+			email_submission_cancel(doc.user, submission_id)
+		except Exception:
+			pass  # Continue even if cancel fails
+
+	# Update scheduled time and reprocess
+	new_dt = get_datetime(new_scheduled_at)
+	doc.db_set("scheduled_at", new_dt)
+
+	# Set flag and reprocess
+	frappe.flags.mail_scheduler_scheduled_at = new_dt
+	try:
+		doc._process()
+	finally:
+		frappe.flags.pop("mail_scheduler_scheduled_at", None)
 
 	return {
-		"status": "Updated",
-		"scheduled_at": new_scheduled_at,
-		"message": _("Scheduled time has been updated"),
+		"success": True,
+		"scheduled_at": str(new_scheduled_at),
+		"message": _("Email rescheduled successfully"),
 	}
 
 
 @frappe.whitelist()
-def get_scheduled_mails(limit: int = 20, offset: int = 0) -> dict:
+def get_scheduled_mails(
+	page_length: int = 20,
+	start: int = 0,
+	status: str | None = None,
+) -> list[dict]:
 	"""
 	Get list of scheduled emails for the current user.
 
 	Args:
-		limit: Maximum number of results
-		offset: Offset for pagination
+		page_length: Number of results to return
+		start: Offset for pagination
+		status: Filter by status (Scheduled, Pending, etc.)
 
 	Returns:
-		dict with list of scheduled emails and total count
+		List of scheduled email dicts
 	"""
 	filters = {
 		"user": frappe.session.user,
 		"scheduled_at": ["is", "set"],
-		"status": ["in", ["Scheduled", "Queued", "Pending"]],
 	}
 
-	total = frappe.db.count("Mail Queue", filters)
+	if status:
+		filters["status"] = status
 
-	emails = frappe.get_all(
+	scheduled_mails = frappe.get_all(
 		"Mail Queue",
 		filters=filters,
-		fields=["name", "subject", "recipients", "scheduled_at", "status", "creation"],
+		fields=[
+			"name",
+			"subject",
+			"from_email",
+			"recipients",
+			"scheduled_at",
+			"status",
+			"creation",
+			"submission_id",
+		],
 		order_by="scheduled_at asc",
-		limit=limit,
-		start=offset,
+		start=start,
+		page_length=page_length,
 	)
 
-	return {
-		"emails": emails,
-		"total": total,
-	}
-
-
-def cancel_scheduled_email(mail_queue) -> None:
-	"""
-	Cancel a scheduled email submission in Stalwart.
-
-	Args:
-		mail_queue: Mail Queue document
-	"""
-	from mail_scheduler.jmap.futurerelease import (
-		email_submission_cancel,
-		get_jmap_client,
-	)
-
-	submission_id = mail_queue.get("submission_id")
-	if not submission_id:
-		# No submission yet, just update status
-		mail_queue.db_set("status", "Cancelled")
-		return
-
-	try:
-		client = get_jmap_client(mail_queue.user)
-		response = email_submission_cancel(client, submission_id)
-
-		updated = response["methodResponses"][0][1].get("updated", {})
-		if submission_id in updated:
-			mail_queue.db_set("status", "Cancelled")
-
-			# Optionally move email back to drafts
-			try:
-				draft_mailbox_id = client.get_mailbox_id_by_role("drafts", create_if_not_exists=True)
-				client.email_update([mail_queue.id], mailbox_id=draft_mailbox_id)
-			except Exception:
-				pass  # Not critical if move fails
-		else:
-			error = response["methodResponses"][0][1].get("notUpdated", {}).get(submission_id, {})
-			frappe.throw(_("Failed to cancel: {0}").format(error.get("description", "Unknown error")))
-
-	except Exception as e:
-		frappe.log_error(_("Failed to cancel scheduled email"), frappe.get_traceback(with_context=True))
-		frappe.throw(_("Failed to cancel scheduled email: {0}").format(str(e)))
-
-
-def update_scheduled_time(mail_queue, new_scheduled_at: str) -> None:
-	"""
-	Update the scheduled time for a pending email.
-
-	Tries direct HOLDUNTIL update first, falls back to cancel+resubmit.
-
-	Args:
-		mail_queue: Mail Queue document
-		new_scheduled_at: New scheduled datetime string
-	"""
-	from mail_scheduler.jmap.futurerelease import (
-		email_submission_cancel,
-		email_submission_get,
-		email_submission_update_schedule,
-		get_jmap_client,
-	)
-
-	submission_id = mail_queue.get("submission_id")
-	if not submission_id:
-		# No submission yet, just update the field
-		mail_queue.db_set("scheduled_at", new_scheduled_at)
-		return
-
-	try:
-		client = get_jmap_client(mail_queue.user)
-
-		# Check if submission is still pending
-		status_response = email_submission_get(client, [submission_id])
-		submissions = status_response["methodResponses"][0][1].get("list", [])
-
-		if not submissions:
-			frappe.throw(_("Scheduled email not found. It may have already been sent."))
-
-		submission = submissions[0]
-		if submission.get("undoStatus") != "pending":
-			frappe.throw(_("Cannot update: Email has already been {0}.").format(
-				submission.get("undoStatus", "processed")
-			))
-
-		# Try direct update
-		response = email_submission_update_schedule(client, submission_id, new_scheduled_at)
-		updated = response["methodResponses"][0][1].get("updated", {})
-
-		if submission_id in updated:
-			mail_queue.db_set("scheduled_at", new_scheduled_at)
-		else:
-			# Fall back to cancel and resubmit
-			_reschedule_email(mail_queue, new_scheduled_at, client)
-
-	except frappe.ValidationError:
-		raise
-	except Exception as e:
-		frappe.log_error(_("Failed to update scheduled email"), frappe.get_traceback(with_context=True))
-		frappe.throw(_("Failed to update scheduled email: {0}").format(str(e)))
-
-
-def _reschedule_email(mail_queue, new_scheduled_at: str, client) -> None:
-	"""
-	Reschedule email by cancelling and resubmitting.
-
-	Args:
-		mail_queue: Mail Queue document
-		new_scheduled_at: New scheduled datetime
-		client: JMAP client instance
-	"""
-	from mail_scheduler.jmap.futurerelease import email_submission_cancel
-
-	submission_id = mail_queue.get("submission_id")
-
-	# Cancel existing submission
-	cancel_response = email_submission_cancel(client, submission_id)
-	updated = cancel_response["methodResponses"][0][1].get("updated", {})
-
-	if submission_id not in updated:
-		error = cancel_response["methodResponses"][0][1].get("notUpdated", {}).get(submission_id, {})
-		frappe.throw(_("Failed to cancel existing schedule: {0}").format(
-			error.get("description", "Unknown error")
-		))
-
-	# Resubmit with new schedule
-	mail_queue.scheduled_at = new_scheduled_at
-	mail_queue._process()
-
-
-def _parse_recipients(recipients) -> list:
-	"""Parse recipients string or list to list."""
-	if isinstance(recipients, str):
-		return [r.strip() for r in recipients.split(",") if r.strip()]
-	elif isinstance(recipients, list):
-		return recipients
-	return []
+	return scheduled_mails
 
 
 def _validate_schedule_time(scheduled_at: str) -> None:
-	"""Validate scheduled time is within allowed range."""
-	from frappe.utils import get_datetime, now_datetime
+	"""
+	Validate that the scheduled time is valid.
 
-	from mail_scheduler.jmap.futurerelease import get_max_schedule_seconds
+	Args:
+		scheduled_at: Datetime string to validate
 
-	scheduled_datetime = get_datetime(scheduled_at)
+	Raises:
+		frappe.ValidationError: If the time is invalid
+	"""
+	try:
+		schedule_dt = get_datetime(scheduled_at)
+	except Exception:
+		frappe.throw(_("Invalid datetime format for scheduled_at"))
+
 	now = now_datetime()
 
-	if scheduled_datetime <= now:
-		frappe.throw(_("Scheduled time must be in the future"))
+	# Must be in the future (with 1 minute grace period)
+	min_schedule_time = add_to_date(now, minutes=1)
+	if schedule_dt < min_schedule_time:
+		frappe.throw(_("Scheduled time must be at least 1 minute in the future"))
 
-	max_seconds = get_max_schedule_seconds()
-	max_datetime = now + frappe.utils.datetime.timedelta(seconds=max_seconds)
+	# Must be within Stalwart's maxDelayedSend limit (30 days)
+	max_schedule_time = add_to_date(now, days=30)
+	if schedule_dt > max_schedule_time:
+		frappe.throw(_("Scheduled time cannot be more than 30 days in the future"))
 
-	if scheduled_datetime > max_datetime:
-		max_days = max_seconds // 86400
-		frappe.throw(_("Scheduled time cannot be more than {0} days in the future").format(max_days))
+
+def get_max_schedule_days() -> int:
+	"""
+	Get the maximum number of days an email can be scheduled in advance.
+
+	Returns:
+		Maximum days (default 30 based on Stalwart's maxDelayedSend)
+	"""
+	return 30

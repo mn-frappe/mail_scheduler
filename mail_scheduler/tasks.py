@@ -18,10 +18,7 @@ def check_scheduled_emails_status():
 	2. Handle failed deliveries
 	3. Clean up expired submissions
 	"""
-	from mail_scheduler.jmap.futurerelease import (
-		email_submission_get,
-		get_jmap_client,
-	)
+	from mail.jmap import get_jmap_client
 
 	# Get scheduled emails that might have been sent
 	scheduled_emails = frappe.get_all(
@@ -48,8 +45,8 @@ def check_scheduled_emails_status():
 			submission_ids = [e.submission_id for e in emails]
 
 			# Get submission statuses
-			response = email_submission_get(client, submission_ids)
-			submissions = response["methodResponses"][0][1].get("list", [])
+			response = _get_submissions_batch(client, submission_ids)
+			submissions = response.get("methodResponses", [[]])[0][1].get("list", [])
 			submission_map = {s["id"]: s for s in submissions}
 
 			for email in emails:
@@ -94,3 +91,29 @@ def _check_if_sent(email):
 	if scheduled_datetime < now_datetime():
 		# Scheduled time has passed, mark as sent
 		frappe.db.set_value("Mail Queue", email.name, "status", "Sent")
+
+
+def _get_submissions_batch(client, submission_ids: list[str]) -> dict:
+	"""
+	Get multiple submission statuses in a single JMAP call.
+
+	Args:
+		client: JMAPClient instance
+		submission_ids: List of submission IDs to retrieve
+
+	Returns:
+		JMAP response with submission details
+	"""
+	return client._make_request(
+		using=["urn:ietf:params:jmap:mail", "urn:ietf:params:jmap:submission"],
+		method_calls=[
+			[
+				"EmailSubmission/get",
+				{
+					"accountId": client.primary_account_id,
+					"ids": submission_ids,
+				},
+				"0",
+			]
+		],
+	)

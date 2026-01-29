@@ -2,149 +2,111 @@
 """
 JMAP FUTURERELEASE Extension for Stalwart Mail Server
 
-This module provides JMAP methods for scheduled email delivery using the
-FUTURERELEASE extension (RFC 4865). It wraps the mail app's JMAP client
-to add scheduling capabilities without modifying the core mail app.
+This module provides the core JMAP integration for scheduled email delivery
+using the FUTURERELEASE extension (RFC 4865).
 
-Stalwart Configuration:
-- maxDelayedSend: 2592000 (30 days in seconds)
-- HOLDUNTIL parameter accepts Unix timestamp
+Stalwart supports:
+- HOLDUNTIL: Unix timestamp for when to release the email
+- HOLDFOR: Number of seconds to delay (relative)
+- maxDelayedSend: 2592000 seconds (30 days)
+
+The HOLDUNTIL parameter is added to envelope.mailFrom.parameters in the
+EmailSubmission/set JMAP call.
 """
 
 import frappe
 from frappe import _
+from frappe.utils import get_datetime
 
 
-def get_jmap_client(user: str | None = None):
-	"""Get JMAP client from mail app."""
-	from mail.jmap import get_jmap_client as _get_jmap_client
-	return _get_jmap_client(user)
+def get_holduntil_timestamp(scheduled_at) -> int:
+	"""
+	Convert a datetime to Unix timestamp for HOLDUNTIL parameter.
+
+	Args:
+		scheduled_at: datetime object or string
+
+	Returns:
+		Unix timestamp as integer
+	"""
+	dt = get_datetime(scheduled_at)
+	return int(dt.timestamp())
 
 
-def email_create_scheduled(
-	client,
-	mailbox_id: str,
-	from_: str,
-	to: list[str],
-	cc: list[str] | None = None,
-	bcc: list[str] | None = None,
-	subject: str = "",
-	text_body: str | None = None,
-	html_body: str | None = None,
-	attachments: list[dict] | None = None,
-	in_reply_to: str | None = None,
-	references: list[str] | None = None,
-	message_id: str | None = None,
-	scheduled_at: str | None = None,
-	custom_headers: dict | None = None,
+def build_scheduled_envelope(
+	from_email: str,
+	recipients: list[dict],
+	creation_id: str,
+	priority: int = 0,
+	scheduled_at=None,
 ) -> dict:
 	"""
-	Create and submit an email with optional FUTURERELEASE scheduling.
+	Build an envelope dict with FUTURERELEASE parameters for scheduled delivery.
 
-	This is a wrapper around the mail app's email_create that adds
-	HOLDUNTIL parameter support for scheduled delivery.
+	This creates the envelope structure needed for EmailSubmission/set with
+	the HOLDUNTIL parameter for scheduled delivery.
 
 	Args:
-		client: JMAP client instance
-		mailbox_id: Target mailbox ID
-		from_: Sender email address
-		to: List of recipient email addresses
-		cc: Optional CC recipients
-		bcc: Optional BCC recipients
-		subject: Email subject
-		text_body: Plain text body
-		html_body: HTML body
-		attachments: List of attachment dicts
-		in_reply_to: Message-ID being replied to
-		references: List of referenced Message-IDs
-		message_id: Custom Message-ID (auto-generated if not provided)
-		scheduled_at: Datetime string for scheduled delivery (local time)
-		custom_headers: Additional email headers
+		from_email: Sender email address
+		recipients: List of recipient dicts with 'email' key
+		creation_id: Unique ID for this submission
+		priority: MT-PRIORITY value (-4 to 4)
+		scheduled_at: datetime for scheduled delivery (None for immediate)
 
 	Returns:
-		JMAP response dict with emailId and submissionId
+		dict: Envelope structure for JMAP EmailSubmission
 	"""
-	from frappe.utils import get_datetime
-
-	# Build the email object
-	email_obj = _build_email_object(
-		mailbox_id=mailbox_id,
-		from_=from_,
-		to=to,
-		cc=cc,
-		bcc=bcc,
-		subject=subject,
-		text_body=text_body,
-		html_body=html_body,
-		attachments=attachments,
-		in_reply_to=in_reply_to,
-		references=references,
-		message_id=message_id,
-		custom_headers=custom_headers,
-	)
-
-	# Build envelope with optional HOLDUNTIL
-	envelope = {
-		"mailFrom": {"email": from_},
-		"rcptTo": [{"email": addr} for addr in (to or []) + (cc or []) + (bcc or [])],
+	# Build mailFrom parameters
+	mail_from_params = {
+		"RET": "FULL",
+		"ENVID": creation_id,
+		"MT-PRIORITY": str(priority),
 	}
 
+	# Add HOLDUNTIL for scheduled delivery
 	if scheduled_at:
-		scheduled_datetime = get_datetime(scheduled_at)
-		# Stalwart expects Unix timestamp for HOLDUNTIL
-		hold_until = str(int(scheduled_datetime.timestamp()))
-		envelope["mailFrom"]["parameters"] = {"HOLDUNTIL": hold_until}
+		holduntil = get_holduntil_timestamp(scheduled_at)
+		mail_from_params["HOLDUNTIL"] = str(holduntil)
 
-	# Create email and submit in a single request
-	return client._make_request(
-		using=[
-			"urn:ietf:params:jmap:core",
-			"urn:ietf:params:jmap:mail",
-			"urn:ietf:params:jmap:submission",
-		],
-		method_calls=[
-			[
-				"Email/set",
-				{
-					"accountId": client.primary_account_id,
-					"create": {"draft": email_obj},
+	envelope = {
+		"mailFrom": {
+			"email": from_email,
+			"parameters": mail_from_params,
+		},
+		"rcptTo": [
+			{
+				"email": rcpt["email"] if isinstance(rcpt, dict) else rcpt,
+				"parameters": {
+					"NOTIFY": "DELAY,FAILURE",
+					"ORCPT": f"rfc822;{rcpt['email'] if isinstance(rcpt, dict) else rcpt}",
 				},
-				"0",
-			],
-			[
-				"EmailSubmission/set",
-				{
-					"accountId": client.primary_account_id,
-					"create": {
-						"submission": {
-							"emailId": "#draft",
-							"identityId": client.get_identity_id(from_),
-							"envelope": envelope,
-						}
-					},
-				},
-				"1",
-			],
+			}
+			for rcpt in recipients
 		],
-	)
+	}
+
+	return envelope
 
 
-def email_submission_cancel(client, submission_id: str) -> dict:
+def email_submission_cancel(user: str, submission_id: str) -> dict:
 	"""
-	Cancel a pending scheduled email submission.
+	Cancel a scheduled email submission.
 
-	Uses JMAP EmailSubmission/set with onSuccessDestroyEmail to cancel
-	a FUTURERELEASE submission that hasn't been sent yet.
+	Uses EmailSubmission/set with update to set undoStatus to "canceled".
 
 	Args:
-		client: JMAP client instance
-		submission_id: The email submission ID to cancel
+		user: User who owns the submission
+		submission_id: JMAP submission ID
 
 	Returns:
-		JMAP response dict
+		dict: JMAP response
 	"""
-	return client._make_request(
-		using=["urn:ietf:params:jmap:submission"],
+	from mail.jmap import get_jmap_client
+
+	client = get_jmap_client(user)
+
+	response = client._make_request(
+		using=["urn:ietf:params:jmap:mail", "urn:ietf:params:jmap:submission"],
 		method_calls=[
 			[
 				"EmailSubmission/set",
@@ -157,184 +119,119 @@ def email_submission_cancel(client, submission_id: str) -> dict:
 					},
 				},
 				"0",
-			],
+			]
 		],
 	)
 
+	return response
 
-def email_submission_get(client, submission_ids: list[str]) -> dict:
+
+def email_submission_get(user: str, submission_id: str) -> dict | None:
 	"""
-	Get email submission details including undoStatus.
+	Get details of an email submission.
 
 	Args:
-		client: JMAP client instance
-		submission_ids: List of submission IDs to retrieve
+		user: User who owns the submission
+		submission_id: JMAP submission ID
 
 	Returns:
-		JMAP response dict with submission details
+		dict: Submission details or None if not found
 	"""
-	return client._make_request(
-		using=["urn:ietf:params:jmap:submission"],
+	from mail.jmap import get_jmap_client
+
+	client = get_jmap_client(user)
+
+	response = client._make_request(
+		using=["urn:ietf:params:jmap:mail", "urn:ietf:params:jmap:submission"],
 		method_calls=[
 			[
 				"EmailSubmission/get",
 				{
 					"accountId": client.primary_account_id,
-					"ids": submission_ids,
-					"properties": ["id", "emailId", "undoStatus", "sendAt", "envelope"],
+					"ids": [submission_id],
 				},
 				"0",
-			],
+			]
 		],
 	)
 
+	submissions = response.get("methodResponses", [[]])[0][1].get("list", [])
+	return submissions[0] if submissions else None
 
-def email_submission_update_schedule(client, submission_id: str, scheduled_at: str) -> dict:
+
+def get_submission_capabilities(user: str) -> dict:
 	"""
-	Update the scheduled send time for a pending email submission.
+	Get the submission capabilities for a user's JMAP account.
 
-	Uses JMAP FUTURERELEASE extension to update the HOLDUNTIL parameter.
-	Note: This only works if undoStatus is still 'pending'.
+	This includes maxDelayedSend and supported extensions.
 
 	Args:
-		client: JMAP client instance
-		submission_id: The email submission ID
-		scheduled_at: New scheduled datetime string
+		user: User to check capabilities for
 
 	Returns:
-		JMAP response dict
+		dict: Submission capabilities
 	"""
-	from frappe.utils import get_datetime
+	from mail.jmap import get_jmap_client
 
-	scheduled_datetime = get_datetime(scheduled_at)
-	hold_until = str(int(scheduled_datetime.timestamp()))
+	client = get_jmap_client(user)
 
-	return client._make_request(
-		using=["urn:ietf:params:jmap:submission"],
-		method_calls=[
-			[
-				"EmailSubmission/set",
-				{
-					"accountId": client.primary_account_id,
-					"update": {
-						submission_id: {
-							"envelope/mailFrom/parameters/HOLDUNTIL": hold_until,
-						}
-					},
-				},
-				"0",
-			],
-		],
-	)
+	# Get account-level capabilities
+	account_id = client.primary_account_id
+	account = client.accounts.get(account_id, {})
+
+	return account.get("urn:ietf:params:jmap:submission", {})
 
 
-def _build_email_object(
-	mailbox_id: str,
-	from_: str,
-	to: list[str],
-	cc: list[str] | None = None,
-	bcc: list[str] | None = None,
-	subject: str = "",
-	text_body: str | None = None,
-	html_body: str | None = None,
-	attachments: list[dict] | None = None,
-	in_reply_to: str | None = None,
-	references: list[str] | None = None,
-	message_id: str | None = None,
-	custom_headers: dict | None = None,
-) -> dict:
-	"""Build JMAP Email object."""
-	import uuid
+def get_max_delayed_send(user: str) -> int:
+	"""
+	Get the maximum delay (in seconds) for scheduled email delivery.
 
-	from frappe.utils import now_datetime
+	Args:
+		user: User to check for
 
-	if not message_id:
-		domain = from_.split("@")[1] if "@" in from_ else "localhost"
-		message_id = f"<{uuid.uuid4()}@{domain}>"
+	Returns:
+		int: Maximum delay in seconds (default 2592000 = 30 days)
+	"""
+	try:
+		caps = get_submission_capabilities(user)
+		return caps.get("maxDelayedSend", 2592000)
+	except Exception:
+		return 2592000  # Default to 30 days
 
-	email_obj = {
-		"mailboxIds": {mailbox_id: True},
-		"from": [{"email": from_}],
-		"to": [{"email": addr} for addr in (to or [])],
-		"subject": subject,
-		"messageId": [message_id],
-		"sentAt": now_datetime().strftime("%Y-%m-%dT%H:%M:%SZ"),
-	}
 
-	if cc:
-		email_obj["cc"] = [{"email": addr} for addr in cc]
+def get_max_schedule_days() -> int:
+	"""
+	Get the maximum number of days an email can be scheduled in advance.
 
-	if bcc:
-		email_obj["bcc"] = [{"email": addr} for addr in bcc]
-
-	if in_reply_to:
-		email_obj["inReplyTo"] = [in_reply_to]
-
-	if references:
-		email_obj["references"] = references
-
-	if custom_headers:
-		email_obj["header:X-Custom-Headers:asText"] = str(custom_headers)
-
-	# Build body parts
-	body_values = {}
-	body_structure = None
-
-	if html_body and text_body:
-		body_values["text"] = {"value": text_body, "charset": "utf-8"}
-		body_values["html"] = {"value": html_body, "charset": "utf-8"}
-		body_structure = {
-			"type": "multipart/alternative",
-			"subParts": [
-				{"partId": "text", "type": "text/plain"},
-				{"partId": "html", "type": "text/html"},
-			],
-		}
-	elif html_body:
-		body_values["html"] = {"value": html_body, "charset": "utf-8"}
-		body_structure = {"partId": "html", "type": "text/html"}
-	elif text_body:
-		body_values["text"] = {"value": text_body, "charset": "utf-8"}
-		body_structure = {"partId": "text", "type": "text/plain"}
-
-	if attachments:
-		# Handle attachments
-		attachment_parts = []
-		for i, att in enumerate(attachments):
-			att_id = f"att{i}"
-			body_values[att_id] = {
-				"value": att.get("content", ""),
-				"charset": "utf-8",
-			}
-			attachment_parts.append({
-				"partId": att_id,
-				"type": att.get("content_type", "application/octet-stream"),
-				"disposition": "attachment",
-				"name": att.get("filename", f"attachment{i}"),
-			})
-
-		if body_structure:
-			body_structure = {
-				"type": "multipart/mixed",
-				"subParts": [body_structure, *attachment_parts],
-			}
-
-	email_obj["bodyValues"] = body_values
-	if body_structure:
-		email_obj["bodyStructure"] = body_structure
-
-	return email_obj
+	Returns:
+		int: Maximum days (30 based on Stalwart default)
+	"""
+	return 30
 
 
 def get_max_schedule_seconds() -> int:
 	"""
-	Get maximum schedule delay in seconds from Stalwart config.
+	Get the maximum number of seconds an email can be scheduled in advance.
 
-	Default is 30 days (2592000 seconds) per Stalwart's maxDelayedSend.
+	Returns:
+		int: Maximum seconds (2592000 = 30 days based on Stalwart default)
 	"""
-	return frappe.conf.get("stalwart_max_delayed_send", 2592000)
+	return 2592000
 
 
-def get_max_schedule_days() -> int:
-	"""Get maximum schedule delay in days."""
-	return get_max_schedule_seconds() // 86400
+def is_futurerelease_supported(user: str) -> bool:
+	"""
+	Check if FUTURERELEASE extension is supported for the user.
+
+	Args:
+		user: User to check for
+
+	Returns:
+		bool: True if FUTURERELEASE is supported
+	"""
+	try:
+		caps = get_submission_capabilities(user)
+		extensions = caps.get("submissionExtensions", {})
+		return "FUTURERELEASE" in extensions
+	except Exception:
+		return False
