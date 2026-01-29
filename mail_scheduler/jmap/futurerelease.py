@@ -179,7 +179,9 @@ def get_submission_capabilities(user: str) -> dict:
 	account_id = client.primary_account_id
 	account = client.accounts.get(account_id, {})
 
-	return account.get("urn:ietf:params:jmap:submission", {})
+	# Capabilities are in accountCapabilities
+	account_caps = account.get("accountCapabilities", {})
+	return account_caps.get("urn:ietf:params:jmap:submission", {})
 
 
 def get_max_delayed_send(user: str) -> int:

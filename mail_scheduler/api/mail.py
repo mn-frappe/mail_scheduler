@@ -53,7 +53,7 @@ def create_mail(
 		dict with id, status, error, and scheduled_at if scheduled
 	"""
 	from mail.client.doctype.mail_queue.mail_queue import MailQueue
-	from mail.utils import convert_img_src_from_file_url_to_cid
+	from mail.api.mail import convert_img_src_from_file_url_to_cid
 
 	# Validate schedule time if provided
 	if scheduled_at and not save_as_draft:
@@ -151,7 +151,8 @@ def update_draft_mail(
 	Returns:
 		dict with id, status, error, and scheduled_at if scheduled
 	"""
-	from mail.utils import convert_html_to_text, convert_img_src_from_base64_to_cid, convert_img_src_from_file_url_to_cid
+	from mail.utils import convert_html_to_text
+	from mail.api.mail import convert_img_src_from_base64_to_cid, convert_img_src_from_file_url_to_cid
 
 	# Validate schedule time if submitting with schedule
 	if scheduled_at and submit:
