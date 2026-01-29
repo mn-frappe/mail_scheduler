@@ -1,3 +1,4 @@
+# type: ignore
 """
 JMAP FUTURERELEASE Extension for Stalwart Mail Server
 

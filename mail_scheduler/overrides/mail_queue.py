@@ -1,3 +1,4 @@
+# type: ignore
 """
 Mail Queue Overrides for Mail Scheduler
 

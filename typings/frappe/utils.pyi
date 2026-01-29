@@ -1,0 +1,6 @@
+# Type stubs for frappe.utils
+from typing import Any
+from datetime import datetime as dt
+
+def get_datetime(dt_str: str | None = None) -> dt: ...
+def now_datetime() -> dt: ...

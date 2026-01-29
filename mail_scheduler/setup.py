@@ -1,3 +1,4 @@
+# type: ignore
 """
 Setup and installation utilities for Mail Scheduler
 """

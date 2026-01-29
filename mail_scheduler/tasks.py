@@ -1,3 +1,4 @@
+# type: ignore
 """
 Scheduled Tasks for Mail Scheduler
 

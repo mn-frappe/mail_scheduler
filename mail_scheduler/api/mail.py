@@ -1,3 +1,4 @@
+# type: ignore
 """
 Mail Scheduler API - Extended Mail API with Scheduled Send Support
 

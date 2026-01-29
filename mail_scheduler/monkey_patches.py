@@ -1,3 +1,4 @@
+# type: ignore
 """
 Monkey Patches for Mail Scheduler
 

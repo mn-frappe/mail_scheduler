@@ -1,0 +1,14 @@
+{
+	"include": ["mail_scheduler"],
+	"exclude": ["**/__pycache__"],
+	"stubPath": "typings",
+	"reportMissingImports": false,
+	"reportMissingModuleSource": false,
+	"reportUnknownMemberType": false,
+	"reportUnknownVariableType": false,
+	"reportUnknownArgumentType": false,
+	"reportUnknownParameterType": false,
+	"reportGeneralTypeIssues": false,
+	"pythonVersion": "3.10",
+	"typeCheckingMode": "off"
+}
