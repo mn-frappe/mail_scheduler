@@ -1,0 +1,1485 @@
+/**
+ * Mail Scheduler - Scheduled Email Send for Frappe Mail
+ *
+ * This module adds "Send Later" functionality to Frappe Mail's compose interface.
+ * It works as an addon without modifying the core mail app.
+ *
+ * Features:
+ * - Schedule button in compose toolbar
+ * - Calendar-based date/time picker
+ * - Quick scheduling options (Tomorrow AM, Tomorrow PM, Monday)
+ * - 12/24 hour time format toggle
+ * - Scheduled emails folder in sidebar
+ */
+
+(function () {
+	"use strict";
+
+	// Configuration from boot
+	const config = frappe.boot?.mail_scheduler || {
+		enabled: true,
+		max_schedule_days: 30,
+	};
+
+	if (!config.enabled) {
+		console.log("Mail Scheduler: Disabled by configuration");
+		return;
+	}
+
+	// State
+	let scheduleModalOpen = false;
+	let selectedScheduleTime = null;
+
+	/**
+	 * Initialize mail scheduler when ready
+	 */
+	if (document.readyState === "loading") {
+		document.addEventListener("DOMContentLoaded", initMailScheduler);
+	} else {
+		setTimeout(initMailScheduler, 500);
+	}
+
+	function initMailScheduler() {
+		console.log("Mail Scheduler: Initializing...");
+
+		// Add CSS styles
+		addStyles();
+
+		// Set up DOM observer for compose toolbar
+		observeComposeToolbar();
+
+		// Set up DOM observer for sidebar
+		observeSidebar();
+
+		// Expose API
+		exposeApi();
+	}
+
+	function addStyles() {
+		if (document.getElementById("mail-scheduler-styles")) return;
+
+		const style = document.createElement("style");
+		style.id = "mail-scheduler-styles";
+		style.textContent = `
+			/* Schedule Button */
+			.mail-scheduler-btn {
+				display: inline-flex;
+				align-items: center;
+				gap: 6px;
+				padding: 6px 12px;
+				font-size: 14px;
+				font-weight: 500;
+				color: var(--text-color, #1f2937);
+				background: var(--bg-color, white);
+				border: 1px solid var(--border-color, #e5e7eb);
+				border-radius: 8px;
+				cursor: pointer;
+				transition: all 0.15s;
+			}
+
+			.mail-scheduler-btn:hover {
+				background: var(--bg-light-gray, #f9fafb);
+				border-color: var(--gray-400, #9ca3af);
+			}
+
+			.mail-scheduler-btn:disabled {
+				opacity: 0.5;
+				cursor: not-allowed;
+			}
+
+			.mail-scheduler-btn svg {
+				width: 16px;
+				height: 16px;
+			}
+
+			/* Dropdown Menu */
+			.mail-scheduler-dropdown {
+				position: relative;
+				display: inline-block;
+			}
+
+			.mail-scheduler-menu {
+				position: absolute;
+				bottom: calc(100% + 4px);
+				right: 0;
+				min-width: 220px;
+				background: white;
+				border: 1px solid var(--border-color, #e5e7eb);
+				border-radius: 8px;
+				box-shadow: 0 10px 15px -3px rgba(0,0,0,0.1), 0 4px 6px -2px rgba(0,0,0,0.05);
+				z-index: 1000;
+				padding: 4px;
+				opacity: 0;
+				visibility: hidden;
+				transform: translateY(8px);
+				transition: all 0.15s;
+			}
+
+			.mail-scheduler-dropdown.open .mail-scheduler-menu {
+				opacity: 1;
+				visibility: visible;
+				transform: translateY(0);
+			}
+
+			.mail-scheduler-menu-item {
+				display: flex;
+				align-items: center;
+				gap: 10px;
+				padding: 10px 12px;
+				font-size: 13px;
+				color: var(--text-color, #374151);
+				border-radius: 6px;
+				cursor: pointer;
+				transition: background 0.1s;
+			}
+
+			.mail-scheduler-menu-item:hover {
+				background: var(--bg-light-gray, #f3f4f6);
+			}
+
+			.mail-scheduler-menu-item svg {
+				width: 16px;
+				height: 16px;
+				color: var(--text-muted, #6b7280);
+			}
+
+			.mail-scheduler-menu-item .label {
+				flex: 1;
+			}
+
+			.mail-scheduler-menu-item .sublabel {
+				font-size: 11px;
+				color: var(--text-muted, #9ca3af);
+			}
+
+			.mail-scheduler-divider {
+				height: 1px;
+				background: var(--border-color, #e5e7eb);
+				margin: 4px 0;
+			}
+
+			/* Modal */
+			.mail-scheduler-modal-overlay {
+				position: fixed;
+				inset: 0;
+				background: rgba(0, 0, 0, 0.5);
+				z-index: 10000;
+				display: flex;
+				align-items: center;
+				justify-content: center;
+				opacity: 0;
+				visibility: hidden;
+				transition: all 0.2s;
+			}
+
+			.mail-scheduler-modal-overlay.open {
+				opacity: 1;
+				visibility: visible;
+			}
+
+			.mail-scheduler-modal {
+				background: white;
+				border-radius: 12px;
+				box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.25);
+				max-width: 420px;
+				width: 100%;
+				max-height: 90vh;
+				overflow: auto;
+				transform: scale(0.95);
+				transition: transform 0.2s;
+			}
+
+			.mail-scheduler-modal-overlay.open .mail-scheduler-modal {
+				transform: scale(1);
+			}
+
+			.mail-scheduler-modal-header {
+				display: flex;
+				align-items: center;
+				justify-content: space-between;
+				padding: 16px 20px;
+				border-bottom: 1px solid var(--border-color, #e5e7eb);
+			}
+
+			.mail-scheduler-modal-title {
+				font-size: 16px;
+				font-weight: 600;
+				color: var(--text-color, #111827);
+			}
+
+			.mail-scheduler-modal-close {
+				padding: 4px;
+				border-radius: 6px;
+				cursor: pointer;
+				transition: background 0.1s;
+			}
+
+			.mail-scheduler-modal-close:hover {
+				background: var(--bg-light-gray, #f3f4f6);
+			}
+
+			.mail-scheduler-modal-body {
+				padding: 20px;
+			}
+
+			.mail-scheduler-modal-footer {
+				display: flex;
+				justify-content: flex-end;
+				gap: 8px;
+				padding: 16px 20px;
+				border-top: 1px solid var(--border-color, #e5e7eb);
+			}
+
+			/* Quick Options */
+			.mail-scheduler-quick-options {
+				display: grid;
+				grid-template-columns: repeat(3, 1fr);
+				gap: 8px;
+				margin-bottom: 16px;
+			}
+
+			.mail-scheduler-quick-option {
+				display: flex;
+				flex-direction: column;
+				align-items: center;
+				padding: 12px 8px;
+				border: 1px solid var(--border-color, #e5e7eb);
+				border-radius: 8px;
+				cursor: pointer;
+				transition: all 0.15s;
+			}
+
+			.mail-scheduler-quick-option:hover {
+				border-color: var(--primary, #2563eb);
+				background: var(--primary-light, #eff6ff);
+			}
+
+			.mail-scheduler-quick-option.selected {
+				border-color: var(--primary, #2563eb);
+				background: var(--primary-light, #eff6ff);
+			}
+
+			.mail-scheduler-quick-option svg {
+				width: 20px;
+				height: 20px;
+				margin-bottom: 4px;
+				color: var(--text-muted, #6b7280);
+			}
+
+			.mail-scheduler-quick-option .label {
+				font-size: 12px;
+				font-weight: 500;
+				color: var(--text-color, #374151);
+			}
+
+			.mail-scheduler-quick-option .time {
+				font-size: 11px;
+				color: var(--text-muted, #9ca3af);
+			}
+
+			/* Calendar */
+			.mail-scheduler-calendar {
+				border: 1px solid var(--border-color, #e5e7eb);
+				border-radius: 8px;
+				padding: 12px;
+				margin-bottom: 16px;
+			}
+
+			.mail-scheduler-calendar-header {
+				display: flex;
+				align-items: center;
+				justify-content: space-between;
+				margin-bottom: 12px;
+			}
+
+			.mail-scheduler-calendar-nav {
+				padding: 4px 8px;
+				border-radius: 6px;
+				cursor: pointer;
+				transition: background 0.1s;
+			}
+
+			.mail-scheduler-calendar-nav:hover {
+				background: var(--bg-light-gray, #f3f4f6);
+			}
+
+			.mail-scheduler-calendar-month {
+				font-weight: 600;
+				font-size: 14px;
+			}
+
+			.mail-scheduler-calendar-weekdays {
+				display: grid;
+				grid-template-columns: repeat(7, 1fr);
+				gap: 2px;
+				margin-bottom: 4px;
+			}
+
+			.mail-scheduler-calendar-weekday {
+				text-align: center;
+				font-size: 11px;
+				font-weight: 500;
+				color: var(--text-muted, #9ca3af);
+				padding: 4px;
+			}
+
+			.mail-scheduler-calendar-days {
+				display: grid;
+				grid-template-columns: repeat(7, 1fr);
+				gap: 2px;
+			}
+
+			.mail-scheduler-calendar-day {
+				aspect-ratio: 1;
+				display: flex;
+				align-items: center;
+				justify-content: center;
+				font-size: 13px;
+				border-radius: 50%;
+				cursor: pointer;
+				transition: all 0.1s;
+			}
+
+			.mail-scheduler-calendar-day:hover:not(.disabled):not(.other-month) {
+				background: var(--bg-light-gray, #f3f4f6);
+			}
+
+			.mail-scheduler-calendar-day.other-month {
+				color: var(--text-light, #d1d5db);
+			}
+
+			.mail-scheduler-calendar-day.today {
+				font-weight: 700;
+				color: var(--primary, #2563eb);
+			}
+
+			.mail-scheduler-calendar-day.selected {
+				background: var(--primary, #2563eb) !important;
+				color: white !important;
+			}
+
+			.mail-scheduler-calendar-day.disabled {
+				color: var(--text-light, #d1d5db);
+				cursor: not-allowed;
+			}
+
+			/* Time Picker */
+			.mail-scheduler-time {
+				margin-bottom: 16px;
+			}
+
+			.mail-scheduler-time-header {
+				display: flex;
+				align-items: center;
+				justify-content: space-between;
+				margin-bottom: 8px;
+			}
+
+			.mail-scheduler-time-label {
+				font-size: 13px;
+				font-weight: 500;
+				color: var(--text-color, #374151);
+			}
+
+			.mail-scheduler-time-format {
+				display: flex;
+				gap: 4px;
+			}
+
+			.mail-scheduler-time-format button {
+				padding: 2px 8px;
+				font-size: 11px;
+				border-radius: 4px;
+				border: none;
+				cursor: pointer;
+				transition: all 0.1s;
+				background: transparent;
+				color: var(--text-muted, #6b7280);
+			}
+
+			.mail-scheduler-time-format button.active {
+				background: var(--bg-gray, #e5e7eb);
+				color: var(--text-color, #374151);
+			}
+
+			.mail-scheduler-time-inputs {
+				display: flex;
+				align-items: center;
+				gap: 8px;
+			}
+
+			.mail-scheduler-time-inputs select {
+				flex: 1;
+				padding: 8px 12px;
+				font-size: 14px;
+				border: 1px solid var(--border-color, #e5e7eb);
+				border-radius: 8px;
+				background: white;
+				cursor: pointer;
+			}
+
+			.mail-scheduler-time-inputs select:focus {
+				outline: none;
+				border-color: var(--primary, #2563eb);
+				box-shadow: 0 0 0 3px var(--primary-light, rgba(37, 99, 235, 0.1));
+			}
+
+			.mail-scheduler-time-separator {
+				font-weight: 600;
+				color: var(--text-muted, #9ca3af);
+			}
+
+			.hidden {
+				display: none !important;
+			}
+
+			/* Summary */
+			.mail-scheduler-summary {
+				background: var(--bg-light-gray, #f9fafb);
+				border-radius: 8px;
+				padding: 12px;
+				display: flex;
+				gap: 12px;
+			}
+
+			.mail-scheduler-summary svg {
+				width: 20px;
+				height: 20px;
+				color: var(--primary, #2563eb);
+				flex-shrink: 0;
+			}
+
+			.mail-scheduler-summary-text {
+				font-size: 13px;
+				color: var(--text-muted, #6b7280);
+			}
+
+			.mail-scheduler-summary-date {
+				font-weight: 600;
+				color: var(--text-color, #111827);
+				margin-top: 2px;
+			}
+
+			.mail-scheduler-summary-relative {
+				font-size: 12px;
+				color: var(--text-muted, #9ca3af);
+				margin-top: 4px;
+			}
+
+			/* Buttons */
+			.mail-scheduler-btn-primary {
+				display: inline-flex;
+				align-items: center;
+				gap: 6px;
+				padding: 8px 16px;
+				font-size: 14px;
+				font-weight: 500;
+				color: white;
+				background: var(--primary, #2563eb);
+				border: none;
+				border-radius: 8px;
+				cursor: pointer;
+				transition: all 0.15s;
+			}
+
+			.mail-scheduler-btn-primary:hover {
+				background: var(--primary-dark, #1d4ed8);
+			}
+
+			.mail-scheduler-btn-primary:disabled {
+				opacity: 0.5;
+				cursor: not-allowed;
+			}
+
+			.mail-scheduler-btn-secondary {
+				display: inline-flex;
+				align-items: center;
+				gap: 6px;
+				padding: 8px 16px;
+				font-size: 14px;
+				font-weight: 500;
+				color: var(--text-color, #374151);
+				background: white;
+				border: 1px solid var(--border-color, #e5e7eb);
+				border-radius: 8px;
+				cursor: pointer;
+				transition: all 0.15s;
+			}
+
+			.mail-scheduler-btn-secondary:hover {
+				background: var(--bg-light-gray, #f9fafb);
+			}
+
+			/* Sidebar Scheduled Folder */
+			.mail-scheduler-sidebar-item {
+				display: flex;
+				align-items: center;
+				gap: 8px;
+				padding: 8px 12px;
+				margin: 2px 8px;
+				border-radius: 8px;
+				cursor: pointer;
+				transition: all 0.15s;
+				color: var(--text-color, #374151);
+				font-size: 14px;
+			}
+
+			.mail-scheduler-sidebar-item:hover {
+				background: var(--bg-light-gray, #f3f4f6);
+			}
+
+			.mail-scheduler-sidebar-item.active {
+				background: var(--primary-light, #eff6ff);
+				color: var(--primary, #2563eb);
+			}
+
+			.mail-scheduler-sidebar-item svg {
+				width: 18px;
+				height: 18px;
+			}
+
+			.mail-scheduler-sidebar-count {
+				margin-left: auto;
+				background: var(--bg-gray, #e5e7eb);
+				color: var(--text-muted, #6b7280);
+				padding: 2px 8px;
+				border-radius: 12px;
+				font-size: 12px;
+				font-weight: 500;
+			}
+
+			/* Scheduled Badge */
+			.mail-scheduler-badge {
+				display: inline-flex;
+				align-items: center;
+				gap: 4px;
+				padding: 2px 8px;
+				background: #fef3c7;
+				color: #92400e;
+				border-radius: 9999px;
+				font-size: 11px;
+				font-weight: 500;
+			}
+		`;
+		document.head.appendChild(style);
+	}
+
+	/**
+	 * Observe DOM for compose toolbar
+	 */
+	function observeComposeToolbar() {
+		const observer = new MutationObserver((mutations) => {
+			for (const mutation of mutations) {
+				for (const node of mutation.addedNodes) {
+					if (node.nodeType === Node.ELEMENT_NODE) {
+						checkAndInjectButton(node);
+					}
+				}
+			}
+		});
+
+		observer.observe(document.body, {
+			childList: true,
+			subtree: true,
+		});
+
+		// Check existing DOM multiple times for SPA initialization
+		setTimeout(() => checkAndInjectButton(document.body), 1000);
+		setTimeout(() => checkAndInjectButton(document.body), 2000);
+		setTimeout(() => checkAndInjectButton(document.body), 5000);
+	}
+
+	/**
+	 * Check for toolbar and inject button
+	 */
+	function checkAndInjectButton(root) {
+		// Look for the compose toolbar with ml-auto flex items-center space-x-2
+		const containers = root.querySelectorAll(".ml-auto.flex.items-center.space-x-2");
+
+		containers.forEach((container) => {
+			// Skip if already injected
+			if (container.querySelector(".mail-scheduler-dropdown")) return;
+
+			// Find Send button - look for button with Send text or SendHorizontal icon
+			const buttons = container.querySelectorAll("button");
+			let sendButton = null;
+
+			buttons.forEach((btn) => {
+				const text = btn.textContent?.trim();
+				// Check if this is the Send button
+				if (text === "Send" || text.includes("Send")) {
+					sendButton = btn;
+				}
+				// Also check for SendHorizontal icon class
+				if (btn.innerHTML.includes("lucide") && btn.innerHTML.includes("send")) {
+					sendButton = btn;
+				}
+			});
+
+			if (sendButton) {
+				console.log("Mail Scheduler: Found Send button, injecting Schedule button");
+				injectScheduleButton(container, sendButton);
+			}
+		});
+	}
+
+	/**
+	 * Inject schedule button into toolbar
+	 */
+	function injectScheduleButton(container, sendButton) {
+		const dropdown = document.createElement("div");
+		dropdown.className = "mail-scheduler-dropdown";
+		dropdown.innerHTML = `
+			<button class="mail-scheduler-btn" type="button">
+				${icons.clock}
+				<span>Schedule</span>
+				${icons.chevronUp}
+			</button>
+			<div class="mail-scheduler-menu">
+				<div class="mail-scheduler-menu-item" data-action="tomorrow-am">
+					${icons.sunrise}
+					<div>
+						<div class="label">Tomorrow morning</div>
+						<div class="sublabel">${getQuickOptionLabel("tomorrow-am")}</div>
+					</div>
+				</div>
+				<div class="mail-scheduler-menu-item" data-action="tomorrow-pm">
+					${icons.sun}
+					<div>
+						<div class="label">Tomorrow afternoon</div>
+						<div class="sublabel">${getQuickOptionLabel("tomorrow-pm")}</div>
+					</div>
+				</div>
+				<div class="mail-scheduler-menu-item" data-action="monday-am">
+					${icons.calendar}
+					<div>
+						<div class="label">Monday morning</div>
+						<div class="sublabel">${getQuickOptionLabel("monday-am")}</div>
+					</div>
+				</div>
+				<div class="mail-scheduler-divider"></div>
+				<div class="mail-scheduler-menu-item" data-action="custom">
+					${icons.clock}
+					<div class="label">Pick date & time...</div>
+				</div>
+			</div>
+		`;
+
+		// Insert before Send button
+		sendButton.parentNode.insertBefore(dropdown, sendButton);
+
+		// Toggle menu
+		const btn = dropdown.querySelector(".mail-scheduler-btn");
+		btn.addEventListener("click", (e) => {
+			e.stopPropagation();
+			dropdown.classList.toggle("open");
+		});
+
+		// Close on outside click
+		document.addEventListener("click", () => {
+			dropdown.classList.remove("open");
+		});
+
+		// Handle menu items
+		dropdown.querySelectorAll(".mail-scheduler-menu-item").forEach((item) => {
+			item.addEventListener("click", (e) => {
+				e.stopPropagation();
+				const action = item.dataset.action;
+				dropdown.classList.remove("open");
+
+				if (action === "custom") {
+					openScheduleModal(sendButton);
+				} else {
+					const scheduledAt = getQuickOptionDate(action);
+					triggerScheduledSend(sendButton, scheduledAt);
+				}
+			});
+		});
+	}
+
+	/**
+	 * Get quick option label
+	 */
+	function getQuickOptionLabel(action) {
+		const date = getQuickOptionDate(action);
+		return date.toLocaleString("en-US", {
+			weekday: "short",
+			month: "short",
+			day: "numeric",
+			hour: "numeric",
+			minute: "2-digit",
+		});
+	}
+
+	/**
+	 * Get quick option date
+	 */
+	function getQuickOptionDate(action) {
+		const now = new Date();
+		const tomorrow = new Date(now);
+		tomorrow.setDate(tomorrow.getDate() + 1);
+
+		switch (action) {
+			case "tomorrow-am":
+				tomorrow.setHours(8, 0, 0, 0);
+				return tomorrow;
+			case "tomorrow-pm":
+				tomorrow.setHours(13, 0, 0, 0);
+				return tomorrow;
+			case "monday-am":
+				const monday = new Date(now);
+				const daysUntilMonday = (8 - now.getDay()) % 7 || 7;
+				monday.setDate(monday.getDate() + daysUntilMonday);
+				monday.setHours(8, 0, 0, 0);
+				return monday;
+			default:
+				return tomorrow;
+		}
+	}
+
+	/**
+	 * Open schedule modal
+	 */
+	function openScheduleModal(sendButton) {
+		// Remove existing modal
+		const existing = document.querySelector(".mail-scheduler-modal-overlay");
+		if (existing) existing.remove();
+
+		// Create modal
+		const overlay = document.createElement("div");
+		overlay.className = "mail-scheduler-modal-overlay";
+		overlay.innerHTML = createModalHTML();
+		document.body.appendChild(overlay);
+
+		// Initialize modal
+		setTimeout(() => {
+			overlay.classList.add("open");
+			initializeModal(overlay, sendButton);
+		}, 10);
+	}
+
+	/**
+	 * Create modal HTML
+	 */
+	function createModalHTML() {
+		const timeFormat = localStorage.getItem("mailSchedulerTimeFormat") || "12h";
+		const tomorrow = new Date();
+		tomorrow.setDate(tomorrow.getDate() + 1);
+
+		return `
+			<div class="mail-scheduler-modal">
+				<div class="mail-scheduler-modal-header">
+					<div class="mail-scheduler-modal-title">Schedule Send</div>
+					<div class="mail-scheduler-modal-close">${icons.x}</div>
+				</div>
+				<div class="mail-scheduler-modal-body">
+					<!-- Quick Options -->
+					<div class="mail-scheduler-quick-options">
+						<div class="mail-scheduler-quick-option" data-action="tomorrow-am">
+							${icons.sunrise}
+							<div class="label">Tomorrow</div>
+							<div class="time">8:00 AM</div>
+						</div>
+						<div class="mail-scheduler-quick-option" data-action="tomorrow-pm">
+							${icons.sun}
+							<div class="label">Tomorrow</div>
+							<div class="time">1:00 PM</div>
+						</div>
+						<div class="mail-scheduler-quick-option" data-action="monday-am">
+							${icons.calendar}
+							<div class="label">Monday</div>
+							<div class="time">8:00 AM</div>
+						</div>
+					</div>
+
+					<!-- Calendar -->
+					<div class="mail-scheduler-calendar">
+						<div class="mail-scheduler-calendar-header">
+							<div class="mail-scheduler-calendar-nav" data-action="prev">${icons.chevronLeft}</div>
+							<div class="mail-scheduler-calendar-month"></div>
+							<div class="mail-scheduler-calendar-nav" data-action="next">${icons.chevronRight}</div>
+						</div>
+						<div class="mail-scheduler-calendar-weekdays">
+							<div class="mail-scheduler-calendar-weekday">S</div>
+							<div class="mail-scheduler-calendar-weekday">M</div>
+							<div class="mail-scheduler-calendar-weekday">T</div>
+							<div class="mail-scheduler-calendar-weekday">W</div>
+							<div class="mail-scheduler-calendar-weekday">T</div>
+							<div class="mail-scheduler-calendar-weekday">F</div>
+							<div class="mail-scheduler-calendar-weekday">S</div>
+						</div>
+						<div class="mail-scheduler-calendar-days"></div>
+					</div>
+
+					<!-- Time -->
+					<div class="mail-scheduler-time">
+						<div class="mail-scheduler-time-header">
+							<div class="mail-scheduler-time-label">Time</div>
+							<div class="mail-scheduler-time-format">
+								<button data-format="12h" class="${timeFormat === "12h" ? "active" : ""}">12h</button>
+								<button data-format="24h" class="${timeFormat === "24h" ? "active" : ""}">24h</button>
+							</div>
+						</div>
+						<div class="mail-scheduler-time-inputs">
+							<select class="mail-scheduler-hour"></select>
+							<span class="mail-scheduler-time-separator">:</span>
+							<select class="mail-scheduler-minute">
+								<option value="0">00</option>
+								<option value="15">15</option>
+								<option value="30">30</option>
+								<option value="45">45</option>
+							</select>
+							<select class="mail-scheduler-period ${timeFormat === "24h" ? "hidden" : ""}">
+								<option value="AM">AM</option>
+								<option value="PM">PM</option>
+							</select>
+						</div>
+					</div>
+
+					<!-- Summary -->
+					<div class="mail-scheduler-summary">
+						${icons.clock}
+						<div>
+							<div class="mail-scheduler-summary-text">Your email will be sent on:</div>
+							<div class="mail-scheduler-summary-date"></div>
+							<div class="mail-scheduler-summary-relative"></div>
+						</div>
+					</div>
+				</div>
+				<div class="mail-scheduler-modal-footer">
+					<button class="mail-scheduler-btn-secondary" data-action="cancel">Cancel</button>
+					<button class="mail-scheduler-btn-primary" data-action="confirm">
+						${icons.send}
+						Schedule Send
+					</button>
+				</div>
+			</div>
+		`;
+	}
+
+	/**
+	 * Initialize modal functionality
+	 */
+	function initializeModal(overlay, sendButton) {
+		const modal = overlay.querySelector(".mail-scheduler-modal");
+		const monthLabel = modal.querySelector(".mail-scheduler-calendar-month");
+		const daysContainer = modal.querySelector(".mail-scheduler-calendar-days");
+		const hourSelect = modal.querySelector(".mail-scheduler-hour");
+		const minuteSelect = modal.querySelector(".mail-scheduler-minute");
+		const periodSelect = modal.querySelector(".mail-scheduler-period");
+		const summaryDate = modal.querySelector(".mail-scheduler-summary-date");
+		const summaryRelative = modal.querySelector(".mail-scheduler-summary-relative");
+
+		let currentMonth = new Date().getMonth();
+		let currentYear = new Date().getFullYear();
+		let selectedDate = new Date();
+		selectedDate.setDate(selectedDate.getDate() + 1);
+		let timeFormat = localStorage.getItem("mailSchedulerTimeFormat") || "12h";
+
+		// Populate hours
+		populateHours();
+
+		// Initial render
+		renderCalendar();
+		updateSummary();
+
+		// Set initial values
+		hourSelect.value = timeFormat === "12h" ? "9" : "9";
+		periodSelect.value = "AM";
+
+		// Close handlers
+		overlay.addEventListener("click", (e) => {
+			if (e.target === overlay) closeModal();
+		});
+
+		modal.querySelector(".mail-scheduler-modal-close").addEventListener("click", closeModal);
+		modal.querySelector('[data-action="cancel"]').addEventListener("click", closeModal);
+
+		// Confirm handler
+		modal.querySelector('[data-action="confirm"]').addEventListener("click", () => {
+			const scheduledAt = getSelectedDateTime();
+			closeModal();
+			triggerScheduledSend(sendButton, scheduledAt);
+		});
+
+		// Calendar navigation
+		modal.querySelector('[data-action="prev"]').addEventListener("click", () => {
+			currentMonth--;
+			if (currentMonth < 0) {
+				currentMonth = 11;
+				currentYear--;
+			}
+			renderCalendar();
+		});
+
+		modal.querySelector('[data-action="next"]').addEventListener("click", () => {
+			currentMonth++;
+			if (currentMonth > 11) {
+				currentMonth = 0;
+				currentYear++;
+			}
+			renderCalendar();
+		});
+
+		// Quick options
+		modal.querySelectorAll(".mail-scheduler-quick-option").forEach((opt) => {
+			opt.addEventListener("click", () => {
+				const action = opt.dataset.action;
+				const date = getQuickOptionDate(action);
+				selectedDate = date;
+				currentMonth = date.getMonth();
+				currentYear = date.getFullYear();
+
+				// Update time inputs
+				const hours = date.getHours();
+				if (timeFormat === "12h") {
+					hourSelect.value = hours > 12 ? hours - 12 : hours === 0 ? 12 : hours;
+					periodSelect.value = hours >= 12 ? "PM" : "AM";
+				} else {
+					hourSelect.value = hours;
+				}
+				minuteSelect.value = date.getMinutes();
+
+				renderCalendar();
+				updateSummary();
+				highlightQuickOption();
+			});
+		});
+
+		// Time format toggle
+		modal.querySelectorAll(".mail-scheduler-time-format button").forEach((btn) => {
+			btn.addEventListener("click", () => {
+				const newFormat = btn.dataset.format;
+				if (newFormat === timeFormat) return;
+
+				// Convert current time
+				const currentHour = parseInt(hourSelect.value);
+				const currentPeriod = periodSelect.value;
+
+				timeFormat = newFormat;
+				localStorage.setItem("mailSchedulerTimeFormat", newFormat);
+
+				// Update UI
+				modal.querySelectorAll(".mail-scheduler-time-format button").forEach((b) => {
+					b.classList.toggle("active", b.dataset.format === newFormat);
+				});
+
+				periodSelect.classList.toggle("hidden", newFormat === "24h");
+				populateHours();
+
+				// Convert hour value
+				if (newFormat === "24h") {
+					let hour24 = currentHour;
+					if (currentPeriod === "PM" && currentHour !== 12) hour24 += 12;
+					if (currentPeriod === "AM" && currentHour === 12) hour24 = 0;
+					hourSelect.value = hour24;
+				} else {
+					let hour12 = currentHour > 12 ? currentHour - 12 : currentHour === 0 ? 12 : currentHour;
+					periodSelect.value = currentHour >= 12 ? "PM" : "AM";
+					hourSelect.value = hour12;
+				}
+
+				updateSummary();
+			});
+		});
+
+		// Time change handlers
+		hourSelect.addEventListener("change", updateSummary);
+		minuteSelect.addEventListener("change", updateSummary);
+		periodSelect.addEventListener("change", updateSummary);
+
+		function populateHours() {
+			hourSelect.innerHTML = "";
+			if (timeFormat === "12h") {
+				for (let i = 1; i <= 12; i++) {
+					hourSelect.innerHTML += `<option value="${i}">${i}</option>`;
+				}
+			} else {
+				for (let i = 0; i < 24; i++) {
+					hourSelect.innerHTML += `<option value="${i}">${i.toString().padStart(2, "0")}</option>`;
+				}
+			}
+		}
+
+		function renderCalendar() {
+			const months = [
+				"January", "February", "March", "April", "May", "June",
+				"July", "August", "September", "October", "November", "December"
+			];
+			monthLabel.textContent = `${months[currentMonth]} ${currentYear}`;
+
+			const firstDay = new Date(currentYear, currentMonth, 1);
+			const lastDay = new Date(currentYear, currentMonth + 1, 0);
+			const startPadding = firstDay.getDay();
+			const today = new Date();
+			const maxDate = new Date();
+			maxDate.setDate(maxDate.getDate() + config.max_schedule_days);
+
+			let html = "";
+
+			// Previous month padding
+			const prevMonthLast = new Date(currentYear, currentMonth, 0);
+			for (let i = startPadding - 1; i >= 0; i--) {
+				const d = prevMonthLast.getDate() - i;
+				html += `<div class="mail-scheduler-calendar-day other-month disabled">${d}</div>`;
+			}
+
+			// Current month
+			for (let i = 1; i <= lastDay.getDate(); i++) {
+				const date = new Date(currentYear, currentMonth, i);
+				const isPast = date < new Date(today.getFullYear(), today.getMonth(), today.getDate());
+				const isTooFar = date > maxDate;
+				const isToday = date.toDateString() === today.toDateString();
+				const isSelected = selectedDate && date.toDateString() === selectedDate.toDateString();
+
+				let classes = ["mail-scheduler-calendar-day"];
+				if (isPast || isTooFar) classes.push("disabled");
+				if (isToday) classes.push("today");
+				if (isSelected) classes.push("selected");
+
+				html += `<div class="${classes.join(" ")}" data-date="${date.toISOString()}">${i}</div>`;
+			}
+
+			// Next month padding
+			const remaining = 42 - (startPadding + lastDay.getDate());
+			for (let i = 1; i <= remaining; i++) {
+				html += `<div class="mail-scheduler-calendar-day other-month disabled">${i}</div>`;
+			}
+
+			daysContainer.innerHTML = html;
+
+			// Add click handlers
+			daysContainer.querySelectorAll(".mail-scheduler-calendar-day:not(.disabled):not(.other-month)").forEach((day) => {
+				day.addEventListener("click", () => {
+					selectedDate = new Date(day.dataset.date);
+					renderCalendar();
+					updateSummary();
+					highlightQuickOption();
+				});
+			});
+		}
+
+		function getSelectedDateTime() {
+			const date = new Date(selectedDate);
+			let hour = parseInt(hourSelect.value);
+			const minute = parseInt(minuteSelect.value);
+
+			if (timeFormat === "12h") {
+				if (periodSelect.value === "PM" && hour !== 12) hour += 12;
+				if (periodSelect.value === "AM" && hour === 12) hour = 0;
+			}
+
+			date.setHours(hour, minute, 0, 0);
+			return date;
+		}
+
+		function updateSummary() {
+			const date = getSelectedDateTime();
+			summaryDate.textContent = date.toLocaleString("en-US", {
+				weekday: "long",
+				year: "numeric",
+				month: "long",
+				day: "numeric",
+				hour: "numeric",
+				minute: "2-digit",
+				hour12: timeFormat === "12h",
+			});
+
+			const now = new Date();
+			const diff = date - now;
+			if (diff < 0) {
+				summaryRelative.textContent = "Time is in the past";
+			} else {
+				const hours = Math.floor(diff / (1000 * 60 * 60));
+				const minutes = Math.floor((diff % (1000 * 60 * 60)) / (1000 * 60));
+				if (hours > 24) {
+					summaryRelative.textContent = `in ${Math.floor(hours / 24)} days`;
+				} else if (hours > 0) {
+					summaryRelative.textContent = `in ${hours} hours and ${minutes} minutes`;
+				} else {
+					summaryRelative.textContent = `in ${minutes} minutes`;
+				}
+			}
+		}
+
+		function highlightQuickOption() {
+			modal.querySelectorAll(".mail-scheduler-quick-option").forEach((opt) => {
+				const action = opt.dataset.action;
+				const optDate = getQuickOptionDate(action);
+				const selected = getSelectedDateTime();
+				opt.classList.toggle(
+					"selected",
+					optDate.toDateString() === selected.toDateString() &&
+						optDate.getHours() === selected.getHours() &&
+						optDate.getMinutes() === selected.getMinutes()
+				);
+			});
+		}
+
+		function closeModal() {
+			overlay.classList.remove("open");
+			setTimeout(() => overlay.remove(), 200);
+		}
+	}
+
+	/**
+	 * Patch frappe.call to intercept mail API calls and inject scheduled_at
+	 */
+	let originalFrappeCall = null;
+	let originalFetch = null;
+	let pendingScheduledAt = null;
+
+	function patchFrappeCall() {
+		if (typeof frappe === "undefined" || !frappe.call) return;
+		if (originalFrappeCall) return; // Already patched
+
+		originalFrappeCall = frappe.call;
+
+		frappe.call = function (opts) {
+			// Check if this is a mail create/update call while we have a pending schedule
+			if (pendingScheduledAt) {
+				const method = opts.method || (opts.args && opts.args.method);
+				
+				// Intercept mail API calls
+				if (method === "mail.api.mail.create_mail" || 
+					method === "mail.api.mail.update_draft_mail") {
+					
+					console.log("Mail Scheduler: Intercepting frappe.call with scheduled_at:", pendingScheduledAt);
+					
+					// Redirect to our API and inject scheduled_at
+					const newOpts = { ...opts };
+					
+					if (method === "mail.api.mail.create_mail") {
+						newOpts.method = "mail_scheduler.api.mail.create_mail";
+					} else {
+						newOpts.method = "mail_scheduler.api.mail.update_draft_mail";
+					}
+					
+					newOpts.args = { ...opts.args, scheduled_at: pendingScheduledAt };
+					
+					// Clear the pending schedule
+					const scheduledAt = pendingScheduledAt;
+					pendingScheduledAt = null;
+					
+					// Wrap success callback to show our toast
+					const originalSuccess = newOpts.callback || newOpts.success;
+					newOpts.callback = function (response) {
+						showToast("Email Scheduled", `Your email will be sent on ${formatScheduledDate(scheduledAt)}`);
+						if (originalSuccess) originalSuccess.call(this, response);
+					};
+					
+					return originalFrappeCall.call(this, newOpts);
+				}
+			}
+
+			// Not a mail call or no pending schedule - pass through
+			return originalFrappeCall.call(this, opts);
+		};
+
+		console.log("Mail Scheduler: Patched frappe.call for API interception");
+	}
+
+	// Patch fetch for frappe-ui's createResource which uses fetch directly
+	function patchFetch() {
+		if (originalFetch) return; // Already patched
+		
+		originalFetch = window.fetch;
+		
+		window.fetch = async function (url, options) {
+			// Check if this is a Frappe API call with a pending schedule
+			if (pendingScheduledAt && options?.body && options?.method === "POST") {
+				const urlStr = url.toString();
+				
+				// Check if it's a mail API call
+				if (urlStr.includes("/api/method/mail.api.mail.create_mail") || 
+					urlStr.includes("/api/method/mail.api.mail.update_draft_mail")) {
+					
+					console.log("Mail Scheduler: Intercepting fetch call to:", urlStr);
+					console.log("Mail Scheduler: Pending scheduled_at:", pendingScheduledAt);
+					
+					try {
+						const body = typeof options.body === "string" 
+							? JSON.parse(options.body) 
+							: options.body;
+						
+						// Modify URL to use our API
+						let newUrl = urlStr;
+						if (urlStr.includes("mail.api.mail.create_mail")) {
+							newUrl = urlStr.replace("mail.api.mail.create_mail", "mail_scheduler.api.mail.create_mail");
+						} else {
+							newUrl = urlStr.replace("mail.api.mail.update_draft_mail", "mail_scheduler.api.mail.update_draft_mail");
+						}
+						
+						console.log("Mail Scheduler: Redirecting to:", newUrl);
+						
+						// Inject scheduled_at into body
+						body.scheduled_at = pendingScheduledAt;
+						
+						// Store for toast callback
+						const scheduledAt = pendingScheduledAt;
+						pendingScheduledAt = null;
+						
+						const newOptions = {
+							...options,
+							body: JSON.stringify(body),
+						};
+						
+						// Make the call
+						const response = await originalFetch.call(this, newUrl, newOptions);
+						
+						// Clone response to read body for logging
+						const responseClone = response.clone();
+						
+						// Show toast on success
+						if (response.ok) {
+							setTimeout(() => {
+								showToast("Email Scheduled", `Your email will be sent on ${formatScheduledDate(scheduledAt)}`);
+							}, 100);
+						} else {
+							// Log error for debugging
+							responseClone.text().then(text => {
+								console.error("Mail Scheduler: API call failed:", text);
+							});
+						}
+						
+						return response;
+					} catch (e) {
+						console.error("Mail Scheduler: Error intercepting fetch:", e);
+					}
+				}
+			}
+			
+			// Pass through
+			return originalFetch.call(this, url, options);
+		};
+		
+		console.log("Mail Scheduler: Patched window.fetch for API interception");
+	}
+
+	// Apply patches on load
+	function applyPatches() {
+		patchFrappeCall();
+		patchFetch();
+	}
+
+	// Apply patches immediately and also when frappe is ready
+	applyPatches();
+	if (typeof frappe !== "undefined" && frappe.ready) {
+		frappe.ready(applyPatches);
+	}
+	document.addEventListener("DOMContentLoaded", applyPatches);
+
+	/**
+	 * Trigger scheduled send
+	 */
+	function triggerScheduledSend(sendButton, scheduledAt) {
+		// Store the scheduled time for API interception
+		pendingScheduledAt = scheduledAt.toISOString();
+		
+		console.log("Mail Scheduler: Scheduling email for", scheduledAt);
+		
+		// Ensure patches are applied
+		patchFrappeCall();
+		patchFetch();
+		
+		// Click the original send button - our patch will intercept the API call
+		sendButton.click();
+		
+		// Clear pending after a timeout in case the click didn't trigger an API call
+		setTimeout(() => {
+			if (pendingScheduledAt) {
+				console.log("Mail Scheduler: Clearing unused pending schedule");
+				pendingScheduledAt = null;
+			}
+		}, 5000);
+	}
+
+	/**
+	 * Show toast notification
+	 */
+	function showToast(title, message) {
+		if (typeof frappe !== "undefined" && frappe.toast) {
+			frappe.toast({ title, message, indicator: "green" });
+		} else {
+			console.log(`[Mail Scheduler] ${title}: ${message}`);
+		}
+	}
+
+	/**
+	 * Format date for display
+	 */
+	function formatScheduledDate(date) {
+		const d = date instanceof Date ? date : new Date(date);
+		return d.toLocaleString("en-US", {
+			weekday: "short",
+			month: "short",
+			day: "numeric",
+			hour: "numeric",
+			minute: "2-digit",
+		});
+	}
+
+	/**
+	 * Observe sidebar for folder injection
+	 */
+	function observeSidebar() {
+		const observer = new MutationObserver((mutations) => {
+			for (const mutation of mutations) {
+				for (const node of mutation.addedNodes) {
+					if (node.nodeType === Node.ELEMENT_NODE) {
+						checkAndInjectSidebarFolder(node);
+					}
+				}
+			}
+		});
+
+		observer.observe(document.body, {
+			childList: true,
+			subtree: true,
+		});
+
+		// Check existing DOM
+		setTimeout(() => checkAndInjectSidebarFolder(document.body), 1000);
+		setTimeout(() => checkAndInjectSidebarFolder(document.body), 3000);
+	}
+
+	/**
+	 * Check and inject Scheduled folder into sidebar
+	 */
+	function checkAndInjectSidebarFolder(root) {
+		// Look for sidebar navigation
+		const navSections = root.querySelectorAll("nav, aside, [class*='sidebar']");
+
+		navSections.forEach((nav) => {
+			// Skip if already injected
+			if (nav.querySelector(".mail-scheduler-sidebar-item")) return;
+
+			// Find folder list - look for Drafts which we insert after
+			const links = nav.querySelectorAll("a, [role='button'], .cursor-pointer");
+			let draftsLink = null;
+			let parentContainer = null;
+
+			links.forEach((link) => {
+				const text = link.textContent?.toLowerCase() || "";
+				if (text.includes("drafts") || text.includes("draft")) {
+					draftsLink = link;
+					parentContainer = link.parentElement;
+				}
+			});
+
+			if (draftsLink && parentContainer) {
+				console.log("Mail Scheduler: Injecting Scheduled folder into sidebar");
+				injectScheduledFolder(parentContainer, draftsLink);
+			}
+		});
+	}
+
+	/**
+	 * Inject scheduled folder into sidebar
+	 */
+	function injectScheduledFolder(container, afterElement) {
+		const scheduledItem = document.createElement("div");
+		scheduledItem.className = "mail-scheduler-sidebar-item";
+		scheduledItem.innerHTML = `
+			${icons.clock}
+			<span>Scheduled</span>
+			<span class="mail-scheduler-sidebar-count" id="mail-scheduler-count">0</span>
+		`;
+
+		// Insert after drafts
+		if (afterElement.nextSibling) {
+			container.insertBefore(scheduledItem, afterElement.nextSibling);
+		} else {
+			container.appendChild(scheduledItem);
+		}
+
+		// Handle click
+		scheduledItem.addEventListener("click", () => {
+			// Navigate to scheduled emails view
+			if (typeof frappe !== "undefined" && frappe.router) {
+				frappe.set_route("mail", "scheduled");
+			} else {
+				window.location.hash = "#/mail/scheduled";
+			}
+		});
+
+		// Load count
+		loadScheduledCount();
+	}
+
+	/**
+	 * Load scheduled emails count
+	 */
+	async function loadScheduledCount() {
+		try {
+			const response = await frappe.call({
+				method: "mail_scheduler.api.scheduled.get_scheduled_emails",
+				args: { limit: 1, offset: 0 },
+			});
+
+			if (response.message) {
+				const countEl = document.getElementById("mail-scheduler-count");
+				if (countEl) {
+					const count = response.message.total || 0;
+					countEl.textContent = count;
+					countEl.style.display = count > 0 ? "block" : "none";
+				}
+			}
+		} catch (e) {
+			console.log("Mail Scheduler: Could not load scheduled count", e);
+		}
+	}
+
+	/**
+	 * Expose API
+	 */
+	function exposeApi() {
+		window.mailScheduler = {
+			config,
+			formatScheduledDate,
+			getMaxScheduleDate: () => {
+				const maxDate = new Date();
+				maxDate.setDate(maxDate.getDate() + config.max_schedule_days);
+				return maxDate;
+			},
+			scheduleEmail: async (mailData, scheduledAt) => {
+				return frappe.call({
+					method: "mail_scheduler.api.mail.create_mail",
+					args: { ...mailData, scheduled_at: scheduledAt },
+				});
+			},
+			cancelScheduledEmail: async (emailId) => {
+				return frappe.call({
+					method: "mail_scheduler.api.scheduled.cancel_scheduled_email",
+					args: { email_id: emailId },
+				});
+			},
+			getScheduledEmails: async (limit = 20, offset = 0) => {
+				return frappe.call({
+					method: "mail_scheduler.api.scheduled.get_scheduled_emails",
+					args: { limit, offset },
+				});
+			},
+			rescheduleEmail: async (emailId, newScheduledAt) => {
+				return frappe.call({
+					method: "mail_scheduler.api.scheduled.reschedule_email",
+					args: { email_id: emailId, scheduled_at: newScheduledAt },
+				});
+			},
+			refreshCount: loadScheduledCount,
+		};
+	}
+
+	// SVG Icons
+	const icons = {
+		clock: `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>`,
+		chevronUp: `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m18 15-6-6-6 6"/></svg>`,
+		chevronLeft: `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m15 18-6-6 6-6"/></svg>`,
+		chevronRight: `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"/></svg>`,
+		sunrise: `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v8"/><path d="m4.93 10.93 1.41 1.41"/><path d="M2 18h2"/><path d="M20 18h2"/><path d="m19.07 10.93-1.41 1.41"/><path d="M22 22H2"/><path d="m8 6 4-4 4 4"/><path d="M16 18a4 4 0 0 0-8 0"/></svg>`,
+		sun: `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2"/><path d="M12 20v2"/><path d="m4.93 4.93 1.41 1.41"/><path d="m17.66 17.66 1.41 1.41"/><path d="M2 12h2"/><path d="M20 12h2"/><path d="m6.34 17.66-1.41 1.41"/><path d="m19.07 4.93-1.41 1.41"/></svg>`,
+		calendar: `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2v4"/><path d="M16 2v4"/><rect width="18" height="18" x="3" y="4" rx="2"/><path d="M3 10h18"/></svg>`,
+		send: `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.536 21.686a.5.5 0 0 0 .937-.024l6.5-19a.496.496 0 0 0-.635-.635l-19 6.5a.5.5 0 0 0-.024.937l7.93 3.18a2 2 0 0 1 1.112 1.11z"/><path d="m21.854 2.147-10.94 10.939"/></svg>`,
+		x: `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>`,
+	};
+})();

@@ -1,0 +1,280 @@
+# type: ignore
+"""
+Scheduled Emails API
+
+API endpoints for managing scheduled emails - list, cancel, reschedule.
+"""
+
+import frappe
+from frappe import _
+from frappe.utils import get_datetime, now_datetime
+
+
+@frappe.whitelist()
+def get_scheduled_emails(limit: int = 20, offset: int = 0) -> dict:
+	"""
+	Get list of scheduled emails for the current user.
+	
+	Returns emails that have been submitted with a scheduled_at time
+	and are waiting to be sent.
+	
+	Args:
+		limit: Maximum number of emails to return
+		offset: Offset for pagination
+		
+	Returns:
+		dict with emails list and total count
+	"""
+	user = frappe.session.user
+	
+	# Query Mail Queue for scheduled emails
+	# These are emails with scheduled_at set and status = 'Submitted'
+	filters = {
+		"user": user,
+		"status": "Submitted",
+		"scheduled_at": ["is", "set"],
+	}
+	
+	emails = frappe.get_all(
+		"Mail Queue",
+		filters=filters,
+		fields=[
+			"name",
+			"id",
+			"from_email",
+			"subject",
+			"scheduled_at",
+			"creation",
+			"status",
+		],
+		order_by="scheduled_at asc",
+		limit=limit,
+		start=offset,
+	)
+	
+	# Get recipients for each email
+	for email in emails:
+		recipients = frappe.get_all(
+			"Mail Queue Recipient",
+			filters={"parent": email.name},
+			fields=["email", "type"],
+		)
+		email["recipients"] = recipients
+		email["to"] = [r["email"] for r in recipients if r["type"] == "To"]
+		email["cc"] = [r["email"] for r in recipients if r["type"] == "Cc"]
+	
+	total = frappe.db.count("Mail Queue", filters)
+	
+	return {
+		"emails": emails,
+		"total": total,
+		"limit": limit,
+		"offset": offset,
+	}
+
+
+@frappe.whitelist()
+def cancel_scheduled_email(email_id: str) -> dict:
+	"""
+	Cancel a scheduled email.
+	
+	This attempts to cancel the email submission in Stalwart using JMAP,
+	and updates the Mail Queue status.
+	
+	Args:
+		email_id: The JMAP email ID or Mail Queue name
+		
+	Returns:
+		dict with success status and message
+	"""
+	user = frappe.session.user
+	
+	# Find the Mail Queue entry
+	mail_queue = frappe.get_value(
+		"Mail Queue",
+		{"user": user, "id": email_id, "status": "Submitted"},
+		["name", "id", "from_email", "scheduled_at"],
+		as_dict=True,
+	)
+	
+	if not mail_queue:
+		# Try by name
+		mail_queue = frappe.get_value(
+			"Mail Queue",
+			{"user": user, "name": email_id, "status": "Submitted"},
+			["name", "id", "from_email", "scheduled_at"],
+			as_dict=True,
+		)
+	
+	if not mail_queue:
+		frappe.throw(_("Scheduled email not found or already sent"))
+	
+	if not mail_queue.scheduled_at:
+		frappe.throw(_("This email is not scheduled"))
+	
+	try:
+		# Try to cancel via JMAP
+		from mail_scheduler.jmap.futurerelease import email_submission_cancel
+		result = email_submission_cancel(user, mail_queue.id)
+		
+		# Update Mail Queue status
+		frappe.db.set_value("Mail Queue", mail_queue.name, {
+			"status": "Cancelled",
+			"error_message": "Cancelled by user",
+		})
+		frappe.db.commit()
+		
+		return {
+			"success": True,
+			"message": _("Scheduled email cancelled successfully"),
+		}
+		
+	except Exception as e:
+		frappe.log_error(f"Failed to cancel scheduled email: {e}")
+		
+		# Still mark as cancelled in our system
+		frappe.db.set_value("Mail Queue", mail_queue.name, {
+			"status": "Cancelled",
+			"error_message": f"Cancelled by user (JMAP cancel failed: {e})",
+		})
+		frappe.db.commit()
+		
+		return {
+			"success": True,
+			"message": _("Email marked as cancelled (server notification may have failed)"),
+		}
+
+
+@frappe.whitelist()
+def reschedule_email(email_id: str, new_scheduled_at: str) -> dict:
+	"""
+	Reschedule a scheduled email to a new time.
+	
+	Args:
+		email_id: The JMAP email ID or Mail Queue name
+		new_scheduled_at: New scheduled datetime (ISO format)
+		
+	Returns:
+		dict with success status and message
+	"""
+	user = frappe.session.user
+	
+	# Validate new time
+	new_datetime = get_datetime(new_scheduled_at)
+	if new_datetime <= now_datetime():
+		frappe.throw(_("Scheduled time must be in the future"))
+	
+	# Check max schedule days
+	from mail_scheduler.jmap.futurerelease import get_max_schedule_seconds
+	max_seconds = get_max_schedule_seconds()
+	max_datetime = now_datetime() + frappe.utils.datetime.timedelta(seconds=max_seconds)
+	
+	if new_datetime > max_datetime:
+		max_days = max_seconds // 86400
+		frappe.throw(_("Scheduled time cannot be more than {0} days in the future").format(max_days))
+	
+	# Find the Mail Queue entry
+	mail_queue = frappe.get_value(
+		"Mail Queue",
+		{"user": user, "id": email_id, "status": "Submitted"},
+		["name", "id", "from_email", "scheduled_at"],
+		as_dict=True,
+	)
+	
+	if not mail_queue:
+		mail_queue = frappe.get_value(
+			"Mail Queue",
+			{"user": user, "name": email_id, "status": "Submitted"},
+			["name", "id", "from_email", "scheduled_at"],
+			as_dict=True,
+		)
+	
+	if not mail_queue:
+		frappe.throw(_("Scheduled email not found or already sent"))
+	
+	if not mail_queue.scheduled_at:
+		frappe.throw(_("This email is not scheduled"))
+	
+	try:
+		# Cancel and resend with new time
+		# Note: JMAP doesn't support rescheduling directly,
+		# so we need to cancel and create a new submission
+		
+		# For now, just update our local record
+		# The email is already in Stalwart's queue with HOLDUNTIL
+		# Stalwart doesn't support changing HOLDUNTIL after submission
+		
+		# Update local record (informational only)
+		frappe.db.set_value("Mail Queue", mail_queue.name, {
+			"scheduled_at": new_datetime,
+		})
+		frappe.db.commit()
+		
+		return {
+			"success": True,
+			"message": _("Schedule updated locally. Note: Server may still send at original time."),
+			"new_scheduled_at": str(new_datetime),
+		}
+		
+	except Exception as e:
+		frappe.log_error(f"Failed to reschedule email: {e}")
+		frappe.throw(_("Failed to reschedule email: {0}").format(str(e)))
+
+
+@frappe.whitelist()
+def get_scheduled_email(email_id: str) -> dict:
+	"""
+	Get details of a single scheduled email.
+	
+	Args:
+		email_id: The JMAP email ID or Mail Queue name
+		
+	Returns:
+		dict with email details
+	"""
+	user = frappe.session.user
+	
+	# Find by ID or name
+	filters = {"user": user}
+	
+	email = frappe.get_value(
+		"Mail Queue",
+		{"user": user, "id": email_id},
+		["name", "id", "from_email", "from_name", "subject", "html_body", 
+		 "scheduled_at", "creation", "status"],
+		as_dict=True,
+	)
+	
+	if not email:
+		email = frappe.get_value(
+			"Mail Queue",
+			{"user": user, "name": email_id},
+			["name", "id", "from_email", "from_name", "subject", "html_body",
+			 "scheduled_at", "creation", "status"],
+			as_dict=True,
+		)
+	
+	if not email:
+		frappe.throw(_("Email not found"))
+	
+	# Get recipients
+	recipients = frappe.get_all(
+		"Mail Queue Recipient",
+		filters={"parent": email.name},
+		fields=["email", "type"],
+	)
+	
+	email["recipients"] = recipients
+	email["to"] = [r["email"] for r in recipients if r["type"] == "To"]
+	email["cc"] = [r["email"] for r in recipients if r["type"] == "Cc"]
+	email["bcc"] = [r["email"] for r in recipients if r["type"] == "Bcc"]
+	
+	# Get attachments
+	attachments = frappe.get_all(
+		"Mail Queue Attachment",
+		filters={"parent": email.name},
+		fields=["filename", "type", "size", "blob_id"],
+	)
+	email["attachments"] = attachments
+	
+	return email

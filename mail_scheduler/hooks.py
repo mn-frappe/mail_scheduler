@@ -56,8 +56,10 @@ scheduler_events = {
 # Boot Session - provide config to frontend
 boot_session = "mail_scheduler.boot.boot_session"
 
-# Include frontend bundle
-app_include_js = "/assets/mail_scheduler/js/mail_scheduler.bundle.js"
+# Include frontend bundles
+# The main bundle handles integration with mail app
+# Frappe's build system will automatically resolve the hashed filename
+app_include_js = "/assets/mail_scheduler/dist/js/mail_scheduler.bundle.js"
 
 # Monkey patches applied on app startup
 after_app_load = "mail_scheduler.monkey_patches.apply_patches"
